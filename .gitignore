@@ -1,7 +1,7 @@
 # Ignore a folder and everything inside it
-Bootstrap_CD
+Bootstrap_CD/
 
-trained_agents
+trained_agents/
 
 # Ignore all `.log` files
 *.log
