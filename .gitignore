@@ -1,5 +1,5 @@
 # Ignore a folder and everything inside it
-CMBPO/Bootstrap_CD
+Code_v2/Bootstrap_CD
 
 # Ignore all `.log` files
 *.log
