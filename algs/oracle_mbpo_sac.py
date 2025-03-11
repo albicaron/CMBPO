@@ -13,7 +13,7 @@ import random
 from pgmpy.estimators import PC
 
 
-class CAUSAL_MBPO_SAC:
+class ORACLE_MBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=True, pure_imaginary=True, lr_model=1e-3,
                  lr_sac=0.0003, gamma=0.99, tau=0.005, alpha=0.2, model_rollout_length=5, num_model_rollouts=400,  # Maybe put 100_000 as it is batched anyway
                  update_size=250, sac_train_freq=1, model_train_freq=100, batch_size=200):

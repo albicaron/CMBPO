@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from envs.causal_env import SimpleCausalEnv
-from algs.causal_mbpo_sac import C_MBPO_SAC
+from algs.oracle_mbpo_sac import ORACLE_MBPO_SAC
 
 import wandb
 import gym
@@ -18,7 +18,7 @@ if __name__ == "__main__":
     model_based = True
     env = SimpleCausalEnv(shifted=False)
 
-    agent = C_MBPO_SAC(env, seed, device, log_wandb=log_wandb, model_based=model_based, pure_imaginary=False)
+    agent = ORACLE_MBPO_SAC(env, seed, device, log_wandb=log_wandb, model_based=model_based, pure_imaginary=False)
     agent.train(num_episodes=100, max_steps=200)
 
     # Save the model
