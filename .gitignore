@@ -3,5 +3,8 @@ Bootstrap_CD/
 
 trained_agents/
 
+Reward_Plot.pdf
+
 # Ignore all `.log` files
 *.log
+.gitignore
