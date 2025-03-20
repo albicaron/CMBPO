@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,13 +51,6 @@ class MBPO_SAC:
         self.imaginary_buffer = ReplayBuffer(int(10_000))
 
     def update_model(self, batch_size=256, epochs=50):
-
-        if len(self.real_buffer) < 5_000:
-            epochs = 50  # Overriding the epochs to train the model more if first 10 episodes
-        elif len(self.real_buffer) < 150_000:
-            epochs = 50
-        else:
-            epochs = epochs
 
         for _ in range(epochs):
 

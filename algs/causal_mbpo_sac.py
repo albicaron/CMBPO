@@ -10,8 +10,6 @@ import wandb
 import time
 import random
 
-from pgmpy.estimators import PC
-
 
 class CAUSAL_MBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=True, pure_imaginary=True, lr_model=1e-3,
