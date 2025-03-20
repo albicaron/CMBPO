@@ -65,7 +65,6 @@ class MBPO_SAC:
             next_s_rew = torch.cat([next_state, reward], dim=1)
 
             # Normalize the inputs
-            # model_input = self.ensemble_model.normalize_inputs(model_input)
             mean_preds, logvar_preds = self.ensemble_model(model_input)
 
             model_loss = 0
@@ -132,7 +131,7 @@ class MBPO_SAC:
         if len(self.imaginary_buffer) == 0:
             proportion_real = 0.05
         else:
-            proportion_real = 0.0
+            proportion_real = 0.00
 
         # Function that creates a new ReplayBuffer with the data from the real buffer and imaginary buffer.
         if self.model_based:
@@ -180,7 +179,7 @@ class MBPO_SAC:
             # 1) First chunk: roll an episode with the real environment and populate the real buffer
             for step in range(max_steps):
 
-                if episode > 5:
+                if total_steps > 1_000:
                     action = self.sac_agent.select_action(state).flatten()
                 else:
                     action = self.env.action_space.sample()
@@ -204,18 +203,15 @@ class MBPO_SAC:
                     model_loss = self.update_model(self.batch_size)
 
                     # if len(self.real_buffer) > 5_000:
-                    if episode > 3:
+                    if total_steps > 1_000:
                         self.imaginary_rollout()
 
                 # 3) Third chunk: train the SAC agent
                 if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
 
-                    for _ in range(1):
+                    for _ in range(5):
 
                         final_buffer = self.get_final_buffer()
-
-                        # Update the SAC agent for 20 epochs
-                        # for _ in range(5):
                         critic_loss, actor_loss, alpha_loss = self.sac_agent.update(final_buffer, self.batch_size)
 
             # 4) Logging and Printing
