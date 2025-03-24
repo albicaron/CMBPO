@@ -1,59 +1,207 @@
-# TODO: Add causal models maybe normalizing flows
+import numpy as np
+import matplotlib.pyplot as plt
+from castle.common import GraphDAG
+from castle.common.priori_knowledge import PrioriKnowledge
+from castle.metrics import MetricsDAG
+from castle.datasets import IIDSimulation, DAG
+from castle.algorithms import PC, DirectLiNGAM
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
+
+def simulate_data(n_node=10, n_edge=10, n=1000, method='linear', sem_type='gauss'):
+    weighted_random_dag = DAG.erdos_renyi(n_nodes=n_node, n_edges=n_edge,
+                                          weight_range=(0.3, 0.5), seed=1)
+    dataset = IIDSimulation(W=weighted_random_dag, n=n, method=method,
+                            sem_type=sem_type)
+    true_causal_matrix, X = dataset.B, dataset.X
+    return true_causal_matrix, X
 
 
-class EnsembleModel(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_units=64, ensemble_size=10, lr=0.001):
-        super(EnsembleModel, self).__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.ensemble_size = ensemble_size
+def set_p_matrix(s_dim, a_dim):
+    tot_nodes = s_dim + a_dim + s_dim + 1  # (s,a,ns,r)
+    p_matrix = np.zeros((tot_nodes, tot_nodes)) - 1  # Initialize all to learnable
+    np.fill_diagonal(p_matrix, 0)  # No self-edges
 
-        self.models = nn.ModuleList([nn.Sequential(
-            nn.Linear(input_dim, hidden_units),
-            nn.SiLU(),
-            nn.Linear(hidden_units, hidden_units),
-            nn.SiLU(),
-            nn.Linear(hidden_units, output_dim * 2)  # +1 for reward prediction, *2 for mean and variance
-        ) for _ in range(ensemble_size)])
+    # Index ranges for (s,a,ns,r)
+    s_idx = np.arange(0, s_dim)
+    a_idx = np.arange(s_dim, s_dim + a_dim)
+    ns_idx = np.arange(s_dim + a_dim, s_dim + a_dim + s_dim)
+    r_idx = np.array([tot_nodes - 1])
 
-        self.model_optimizer = optim.Adam(self.parameters(), lr=lr)
+    # Set forbidden edges (0s)
 
-        self.mean = None
-        self.std = None
+    # No s to a, or a to s (no intra-layer edges between s and a)
+    p_matrix[np.ix_(s_idx, a_idx)] = 0
+    p_matrix[np.ix_(a_idx, s_idx)] = 0
 
-    def forward(self, x):
+    # No edges to s or a (from ns or r or anywhere)
+    p_matrix[:, s_idx] = 0
+    p_matrix[:, a_idx] = 0
 
-        # # First normalize the inputs
-        # x = self.normalize_inputs(x)
+    # No edges from ns or r to anywhere (no reverse time edges)
+    p_matrix[ns_idx, :] = 0
+    p_matrix[r_idx, :] = 0
 
-        # Return the mean and variance of the state and reward predictions
-        means = []
-        logvars = []
-        for model in self.models:
-            pred = model(x)
-            mean = pred[:, :self.output_dim]  # State and reward mean are the first (state_dim + 1) elements
-            logvar = pred[:, self.output_dim:]  # logvar is the last (state_dim + 1) elements
+    # Allow only learnable edges from (s, a) to (ns, r)
+    learnable_from = np.concatenate([s_idx, a_idx])
+    learnable_to = np.concatenate([ns_idx, r_idx])
+    # We already initialized everything to -1, so make everything else 0
+    p_matrix[:, :] = 0
+    p_matrix[np.ix_(learnable_from, learnable_to)] = -1
+    np.fill_diagonal(p_matrix, 0)
 
-            means.append(mean)
-            logvars.append(logvar)
+    return p_matrix
 
-        # Denormalize the outputs
-        # means = [self.denormalize_inputs(mean) for mean in means]
 
-        return means, logvars
+class StructureLearning:
+    def __init__(self, n_nodes, n_edges, sl_method="PC", bootstrap=None):
+        self.n_nodes = n_nodes
+        self.n_edges = n_edges
+        self.sl_method = sl_method
 
-    def normalize_inputs(self, x):
+        # check the bootstrap either is None, 'standard', or 'bayesian'
+        if bootstrap not in [None, 'standard', 'bayesian']:
+            raise ValueError("The bootstrap should be either None, 'standard', or 'bayesian'.")
 
-        self.mean = x.mean(dim=0)
-        self.std = x.std(dim=0) + 1e-6
+        self.bootstrap = bootstrap
 
-        return (x - self.mean) / self.std
+    def learn_dag(self, X, prior_knowledge=None, n_bootstrap=100):
 
-    def denormalize_outputs(self, x):
+        if self.sl_method == "PC":
+            causal_matrix = self.pc_learn(X, prior_knowledge, n_bootstrap)
+        elif self.sl_method == "LiNGAM":
+            causal_matrix = self.lingam_learn(X, prior_knowledge, n_bootstrap)
+        else:
+            raise ValueError("The structure learning method is not supported.")
 
-        return x * self.std + self.mean
+        return causal_matrix
+
+    def set_prior_knowledge(self, p_matrix=None):
+        """
+        Set prior knowledge for the structure learning algorithm, in matrix form. 0s are forbidden edges,
+        1s are required edges. -1s are learnable edges.
+        p_matrix: np.array, shape (n_nodes, n_nodes)
+        """
+
+        p = PrioriKnowledge(self.n_nodes)
+        p.matrix = p_matrix
+
+        return p
+
+    def pc_learn(self, X, p=None, n_bootstrap=50):
+
+        if self.bootstrap == 'standard':
+
+            aggregated_matrix = np.zeros((self.n_nodes, self.n_nodes))
+            n_samples = X.shape[0]
+
+            for i in range(n_bootstrap):
+                # Resample with replacement (classical bootstrap)
+                indices = np.random.choice(n_samples, size=n_samples, replace=True)
+                X_boot = X[indices, :]
+
+                # Learn graph on bootstrap sample with the prior knowledge
+                pc = PC(priori_knowledge=p)
+                pc.learn(X_boot)
+
+                # Aggregate (here simply summing the binary matrices)
+                aggregated_matrix += pc.causal_matrix
+
+            # Average over replicates to get edge frequencies (0 to 1)
+            aggregated_matrix /= n_bootstrap
+
+            causal_matrix = aggregated_matrix
+
+        elif self.bootstrap == 'bayesian':
+            aggregated_matrix = np.zeros((self.n_nodes, self.n_nodes))
+            n_samples = X.shape[0]
+
+            for i in range(n_bootstrap):
+                # Draw weights from a Dirichlet distribution (each weight is non-negative and sums to 1)
+                weights = np.random.dirichlet(np.ones(n_samples))
+
+                # Use weights as probabilities to sample with replacement
+                indices = np.random.choice(n_samples, size=n_samples, replace=True, p=weights)
+                X_bayes = X[indices, :]
+
+                # Learn graph on Bayes bootstrap sample with the prior knowledge
+                pc = PC(priori_knowledge=p)
+                pc.learn(X_bayes)
+
+                # Aggregate (here simply summing the binary matrices)
+                aggregated_matrix += pc.causal_matrix
+
+            # Average over replicates to get edge frequencies (0 to 1)
+            aggregated_matrix /= n_bootstrap
+            causal_matrix = aggregated_matrix
+
+        else:
+            # No bootstrap
+            pc = PC(priori_knowledge=p)
+            pc.learn(X)
+            causal_matrix = pc.causal_matrix
+
+        return causal_matrix
+
+    def lingam_learn(self, X, p=None, n_bootstrap=100):
+
+        if self.bootstrap == 'standard':
+
+            aggregated_matrix = np.zeros((self.n_nodes, self.n_nodes))
+            n_samples = X.shape[0]
+
+            for i in range(n_bootstrap):
+                # Resample with replacement (classical bootstrap)
+                indices = np.random.choice(n_samples, size=n_samples, replace=True)
+                X_boot = X[indices, :]
+
+                # Learn graph on bootstrap sample with the prior knowledge
+                lingam = DirectLiNGAM(prior_knowledge=p.matrix)
+                lingam.learn(X_boot)
+
+                # Aggregate (here simply summing the binary matrices)
+                aggregated_matrix += lingam.causal_matrix
+
+            # Average over replicates to get edge frequencies (0 to 1)
+            aggregated_matrix /= n_bootstrap
+
+            causal_matrix = aggregated_matrix
+
+        elif self.bootstrap == 'bayesian':
+
+            aggregated_matrix = np.zeros((self.n_nodes, self.n_nodes))
+            n_samples = X.shape[0]
+
+            for i in range(n_bootstrap):
+                # Draw weights from a Dirichlet distribution (each weight is non-negative and sums to 1)
+                weights = np.random.dirichlet(np.ones(n_samples))
+
+                # Use weights as probabilities to sample with replacement
+                indices = np.random.choice(n_samples, size=n_samples, replace=True, p=weights)
+                X_bayes = X[indices, :]
+
+                # Learn graph on Bayes bootstrap sample with the prior knowledge
+                lingam = DirectLiNGAM(prior_knowledge=p.matrix)
+                lingam.learn(X_bayes)
+
+                # Aggregate (here simply summing the binary matrices)
+                aggregated_matrix += lingam.causal_matrix
+
+            # Average over replicates to get edge frequencies (0 to 1)
+            aggregated_matrix /= n_bootstrap
+            causal_matrix = aggregated_matrix
+
+        else:
+            # No bootstrap
+            lingam = DirectLiNGAM(prior_knowledge=p.matrix)
+            lingam.learn(X)
+            causal_matrix = lingam.causal_matrix
+
+        return causal_matrix
+
+    def plot_dag(self, predict_dag, true_dag, save_name=None):
+        GraphDAG(predict_dag, true_dag, show=False, save_name=save_name)
+
+    def calculate_metrics(self, predict_dag, true_dag):
+        mt = MetricsDAG(predict_dag, true_dag)
+        return mt.metrics
+

@@ -1,7 +1,7 @@
 import torch
 
 from envs.causal_env import SimpleCausalEnv
-from algs.mbpo_sac import MBPO_SAC
+from algs.cmbpo_sac import CMBPO_SAC
 
 
 if __name__ == "__main__":
@@ -15,7 +15,7 @@ if __name__ == "__main__":
     model_based = True
     env = SimpleCausalEnv(shifted=False)
 
-    agent = MBPO_SAC(env, seed, device, log_wandb=log_wandb, model_based=model_based, pure_imaginary=False)
+    agent = CMBPO_SAC(env, seed, device, log_wandb=log_wandb, model_based=model_based, pure_imaginary=False)
     agent.train(num_episodes=100, max_steps=200)
 
     # Save the model

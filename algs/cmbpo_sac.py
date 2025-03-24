@@ -5,14 +5,17 @@ import torch.nn.functional as F
 from algs.sac import SAC, ReplayBuffer
 from dynamics.utils import compute_jsd
 from dynamics.dynamics_models import EnsembleModel
+from dynamics.causal_models import StructureLearning, set_p_matrix
 
 import wandb
 import time
 import random
 
 
-class MBPO_SAC:
-    def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True, lr_model=1e-3,
+class CMBPO_SAC:
+    def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True,
+                 sl_method="PC", bootstrap=None, cgm_train_freq=1_000,
+                 lr_model=1e-3,
                  lr_sac=0.0003, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15, num_model_rollouts=400,  # Maybe put 100_000 as it is batched anyway
                  update_size=250, sac_train_freq=1, model_train_freq=100, batch_size=250):
 
@@ -21,7 +24,7 @@ class MBPO_SAC:
         self.log_wandb = log_wandb
         self.model_based = model_based
         self.pure_imaginary = pure_imaginary
-        self.alg_name = 'MBPO_SAC' if self.model_based else 'SAC'
+        self.alg_name = 'CMBPO_SAC' if self.model_based else 'SAC'
 
         self.state_dim = env.observation_space.shape[0]
         self.action_dim = env.action_space.shape[0]
@@ -50,6 +53,14 @@ class MBPO_SAC:
 
         self.real_buffer = ReplayBuffer(int(10_000))
         self.imaginary_buffer = ReplayBuffer(int(10_000))
+
+        # Causal MBPO specific
+        self.sl_method = sl_method
+        self.bootstrap = bootstrap
+        self.cgm_train_freq = cgm_train_freq
+        self.local_cgm = StructureLearning(n_nodes=self.state_dim, n_edges=self.action_dim, sl_method=sl_method,
+                                           bootstrap=bootstrap)
+        self.p_matrix = set_p_matrix(self.state_dim, self.action_dim)
 
     def update_model(self, batch_size=256, epochs=50):
 
@@ -210,7 +221,7 @@ class MBPO_SAC:
             episode_reward = 0
             episode_steps = 0
 
-            # 1) First chunk: roll an episode with the real environment and populate the real buffer
+            # 1) First chunk: roll an episode within the real environment and populate the real buffer
             for step in range(max_steps):
 
                 if total_steps > 1_000:
@@ -240,7 +251,21 @@ class MBPO_SAC:
                     if total_steps > 1_000:
                         self.imaginary_rollout()
 
-                # 3) Third chunk: train the SAC agent
+                # 3) Learn Local Causal Graphical Model from the real buffer
+                if total_steps % self.cgm_train_freq == 0:
+
+                    # Learn the CGM with the last self.cgm_train_freq samples
+                    p = self.local_cgm.set_prior_knowledge(p_matrix=self.p_matrix)
+                    est_cgm = self.local_cgm.learn_dag(self.real_buffer[:-self.cgm_train_freq], prior_knowledge=p)
+
+                    print('HERE')
+
+                    # TODO: Implement the rest of the algorithm
+
+
+
+
+                # 4) Third chunk: train the SAC agent
                 if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
 
                     for _ in range(5):
