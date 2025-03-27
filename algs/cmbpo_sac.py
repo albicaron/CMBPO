@@ -1,20 +1,24 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 from algs.sac import SAC, ReplayBuffer
-from dynamics.utils import compute_jsd
-from dynamics.dynamics_models import EnsembleModel
 from dynamics.causal_models import StructureLearning, set_p_matrix
+from dynamics.utils import compute_jsd, compute_causal_emp
+from dynamics.dynamics_models import EnsembleModel
 
 import wandb
 import time
 import random
 
+torch.set_default_dtype(torch.float32)
+
 
 class CMBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True,
-                 sl_method="PC", bootstrap=None, cgm_train_freq=1_000,
+                 sl_method="PC", bootstrap='standard', cgm_train_freq=1_000,
+                 causal_bonus=True, causal_eta=0.1,
+                 jsd_thres=1.0, jsd_bonus=False, jsd_eta=0.1,
                  lr_model=1e-3,
                  lr_sac=0.0003, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15, num_model_rollouts=400,  # Maybe put 100_000 as it is batched anyway
                  update_size=250, sac_train_freq=1, model_train_freq=100, batch_size=250):
@@ -54,13 +58,23 @@ class CMBPO_SAC:
         self.real_buffer = ReplayBuffer(int(10_000))
         self.imaginary_buffer = ReplayBuffer(int(10_000))
 
+        self.jsd_thres, self.jsd_bonus, self.jsd_eta = jsd_thres, jsd_bonus, jsd_eta
+
         # Causal MBPO specific
         self.sl_method = sl_method
         self.bootstrap = bootstrap
         self.cgm_train_freq = cgm_train_freq
-        self.local_cgm = StructureLearning(n_nodes=self.state_dim, n_edges=self.action_dim, sl_method=sl_method,
-                                           bootstrap=bootstrap)
+        self.local_cgm = StructureLearning(n_nodes=self.state_dim + self.action_dim + self.state_dim + 1,
+                                           sl_method=sl_method, bootstrap=bootstrap)
         self.p_matrix = set_p_matrix(self.state_dim, self.action_dim)
+        self.pk = self.local_cgm.set_prior_knowledge(p_matrix=self.p_matrix)
+
+        # Initialize the estimated CGM as a fully connected graph
+        self.est_cgm = np.ones((self.state_dim + self.action_dim + self.state_dim + 1,
+                                self.state_dim + self.action_dim + self.state_dim + 1))
+        self.true_cgm = self.env.get_adj_matrix() if hasattr(self.env, 'get_adj_matrix') else None
+
+        self.causal_bonus, self.causal_eta = causal_bonus, causal_eta
 
     def update_model(self, batch_size=256, epochs=50):
 
@@ -91,7 +105,7 @@ class CMBPO_SAC:
 
         return model_loss.item()
 
-    def imaginary_rollout(self):
+    def counterfact_rollout(self):
         """
         Rolls out from real states using the learned model. The length of each rollout
         is dynamically adjusted based on ensemble disagreement/uncertainty.
@@ -126,6 +140,11 @@ class CMBPO_SAC:
 
         current_states = initial_states.clone().numpy()
 
+        # Sample a causal graph mask for each sample in the batch, for each in parents (ns, r)
+        sub_cgm_matrix = self.est_cgm[:(self.state_dim + self.action_dim), (self.state_dim + self.action_dim):]
+        sub_cgm_matrix = torch.FloatTensor(sub_cgm_matrix).to(self.device)
+        causal_masks = torch.bernoulli(sub_cgm_matrix.unsqueeze(0).repeat(num_samples, 1, 1))
+
         for t in range(max_length_traj):
 
             # If everything is "inactive", exit early
@@ -139,8 +158,18 @@ class CMBPO_SAC:
 
             # Ensemble predictions: shape [ensemble_size, batch_size, next_state_dim+1]
             with torch.no_grad():
-                mean_preds, logvar_preds = self.ensemble_model(model_input)
-            all_preds_mean, all_preds_var = torch.stack(mean_preds, dim=0), torch.stack(logvar_preds, dim=0)
+
+                # Here for each target variable in (ns, r), we multiply the parent causal mask
+                # to get the parents of each target variable
+                all_preds_mean = torch.zeros(self.ensemble_model.ensemble_size, num_samples, self.state_dim + 1)
+                all_preds_var = torch.zeros(self.ensemble_model.ensemble_size, num_samples, self.state_dim + 1)
+
+                # Loop over the target variables
+                for i in range(self.state_dim + 1):
+                    masked_inputs = model_input * causal_masks[:, :, i]
+                    mean_pred_i, logvar_pred_i = self.ensemble_model(masked_inputs)
+                    mean_pred_i, logvar_pred_i = torch.stack(mean_pred_i, dim=0), torch.stack(logvar_pred_i, dim=0)
+                    all_preds_mean[:, :, i], all_preds_var[:, :, i] = mean_pred_i[:, :, i], logvar_pred_i[:, :, i]
 
             # Next state is sampled from the ensemble
             ensemble_idx = torch.randint(self.ensemble_model.ensemble_size, (1,)).item()
@@ -149,8 +178,23 @@ class CMBPO_SAC:
             rewards = mean_pred[:, -1].unsqueeze(1)
             dones = torch.zeros_like(rewards)
 
-            # Compute uncertainty as disagreement across ensemble (JSD)
+            # Compute uncertainty as disagreement across ensemble (JSD) - can use it also as intrinsic reward
             ns_jsd = compute_jsd(all_preds_mean, torch.exp(all_preds_var))
+
+            if self.jsd_bonus:
+                rewards += self.jsd_eta * ns_jsd
+
+            if self.causal_bonus:
+
+                emp_rewards = compute_causal_emp(self.ensemble_model, causal_masks, current_states, self.sac_agent)
+
+
+                # TODO: Implement the causal bonus
+                print("Implement the causal bonus")
+
+
+
+
 
             # We only continue rolling out for samples with active_mask == True
             # If the uncertainty is above threshold, we turn off that sample
@@ -170,6 +214,20 @@ class CMBPO_SAC:
             current_states = next_states.detach()
 
         # End of imaginary rollouts
+
+    def update_cgm(self):
+
+        # Learn the CGM with the last self.cgm_train_freq samples
+        last_cgm_data = self.real_buffer.buffer[-self.cgm_train_freq:]
+        state, action, reward, next_state, _ = map(np.stack, zip(*last_cgm_data))
+        reward = reward.reshape(-1, 1)
+
+        data_cgm = np.concatenate([state, action, next_state, reward], axis=1)
+        self.est_cgm = self.local_cgm.learn_dag(data_cgm, prior_knowledge=self.pk)
+
+        # Plot DAG at the end of the training
+        if self.log_wandb and len(self.real_buffer) % 10_000 == 0:
+            self.local_cgm.plot_dag(self.est_cgm, self.true_cgm, save_name=f"Estimated CGM at {len(self.real_buffer)} samples")
 
     def get_final_buffer(self):
 
@@ -249,21 +307,14 @@ class CMBPO_SAC:
 
                     # if len(self.real_buffer) > 5_000:
                     if total_steps > 1_000:
-                        self.imaginary_rollout()
+
+                        self.counterfact_rollout()
 
                 # 3) Learn Local Causal Graphical Model from the real buffer
                 if total_steps % self.cgm_train_freq == 0:
 
                     # Learn the CGM with the last self.cgm_train_freq samples
-                    p = self.local_cgm.set_prior_knowledge(p_matrix=self.p_matrix)
-                    est_cgm = self.local_cgm.learn_dag(self.real_buffer[:-self.cgm_train_freq], prior_knowledge=p)
-
-                    print('HERE')
-
-                    # TODO: Implement the rest of the algorithm
-
-
-
+                    self.update_cgm()
 
                 # 4) Third chunk: train the SAC agent
                 if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:

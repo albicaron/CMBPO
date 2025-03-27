@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+
 from castle.common import GraphDAG
 from castle.common.priori_knowledge import PrioriKnowledge
 from castle.metrics import MetricsDAG
@@ -53,9 +54,8 @@ def set_p_matrix(s_dim, a_dim):
 
 
 class StructureLearning:
-    def __init__(self, n_nodes, n_edges, sl_method="PC", bootstrap=None):
+    def __init__(self, n_nodes, sl_method="PC", bootstrap=None):
         self.n_nodes = n_nodes
-        self.n_edges = n_edges
         self.sl_method = sl_method
 
         # check the bootstrap either is None, 'standard', or 'bayesian'
@@ -75,15 +75,17 @@ class StructureLearning:
 
         return causal_matrix
 
-    def set_prior_knowledge(self, p_matrix=None):
-        """
-        Set prior knowledge for the structure learning algorithm, in matrix form. 0s are forbidden edges,
-        1s are required edges. -1s are learnable edges.
-        p_matrix: np.array, shape (n_nodes, n_nodes)
-        """
-
+    def set_prior_knowledge(self, p_matrix):
         p = PrioriKnowledge(self.n_nodes)
-        p.matrix = p_matrix
+
+        # Based on p_matrix, add forbidden edges according to the prior p_matrix
+        no_edge_constr = []
+        for i in range(p_matrix.shape[0]):
+            for j in range(p_matrix.shape[1]):
+                if p_matrix[i, j] == 0:
+                    no_edge_constr.append((i, j))
+
+        p.add_forbidden_edges(no_edge_constr)
 
         return p
 
@@ -198,10 +200,17 @@ class StructureLearning:
 
         return causal_matrix
 
+    def sample_causal_mask(self, parent_set_proba):
+        causal_mask = np.random.binomial(1, parent_set_proba, size=(self.n_nodes, self.n_nodes))
+        np.fill_diagonal(causal_mask, 0)
+        return causal_mask
+
     def plot_dag(self, predict_dag, true_dag, save_name=None):
         GraphDAG(predict_dag, true_dag, show=False, save_name=save_name)
 
     def calculate_metrics(self, predict_dag, true_dag):
         mt = MetricsDAG(predict_dag, true_dag)
         return mt.metrics
+
+
 

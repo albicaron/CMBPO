@@ -88,6 +88,23 @@ class SimpleCausalEnv(gym.Env):
 
         return self.state, R_t, done, False, None
 
+    def get_adj_matrix(self):
+        """
+        Return the adjacency matrix of the causal graph underlying the environment dynamics and rewards of the
+        (s,a,ns,r) tuples. Which means this is a 6x6 matrix where the first 2 rows and columns correspond to the
+        state variables S1 and S2, the next 2 rows and columns correspond to the action variable A and the next 2 rows
+        and columns correspond to the next state variables S1' and S2' and the reward variable R. No self-loops
+        :return:
+        """
+        adj_matrix = np.zeros((6, 6))
+        adj_matrix[0, 1] = 1  # S1 -> S2
+        adj_matrix[0, 3] = 1  # S1 -> S1'
+        adj_matrix[2, 3] = 1  # A -> S1'
+        adj_matrix[3, 4] = 1  # S1' -> S2'
+        adj_matrix[3, 5] = 1  # S1' -> R
+
+        return adj_matrix
+
     def render(self, mode='human'):
         """
         Render the environment to the screen (optional).
