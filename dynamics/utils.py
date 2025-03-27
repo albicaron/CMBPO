@@ -155,10 +155,6 @@ def compute_causal_emp(deep_ensemble,
     return causal_empow
 
 
-    print('HERE')
-
-
-
 def gaussian_1d_entropy(var_1d):
     """
     Differential entropy for a 1D Gaussian N(., var_1d):

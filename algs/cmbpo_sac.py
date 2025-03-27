@@ -17,7 +17,7 @@ torch.set_default_dtype(torch.float32)
 class CMBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True,
                  sl_method="PC", bootstrap='standard', cgm_train_freq=1_000,
-                 causal_bonus=True, causal_eta=0.1,
+                 causal_bonus=True, causal_eta=0.1, var_causal_bonus=False, var_causal_eta=0.1,
                  jsd_thres=1.0, jsd_bonus=False, jsd_eta=0.1,
                  lr_model=1e-3,
                  lr_sac=0.0003, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15, num_model_rollouts=400,  # Maybe put 100_000 as it is batched anyway
@@ -75,6 +75,7 @@ class CMBPO_SAC:
         self.true_cgm = self.env.get_adj_matrix() if hasattr(self.env, 'get_adj_matrix') else None
 
         self.causal_bonus, self.causal_eta = causal_bonus, causal_eta
+        self.var_causal_bonus, self.var_causal_eta = var_causal_bonus, var_causal_eta
 
     def update_model(self, batch_size=256, epochs=50):
 
@@ -186,15 +187,14 @@ class CMBPO_SAC:
 
             if self.causal_bonus:
 
-                emp_rewards = compute_causal_emp(self.ensemble_model, causal_masks, current_states, self.sac_agent)
+                causal_empow = compute_causal_emp(self.ensemble_model, causal_masks, current_states, self.sac_agent)
+                causal_empow_bonus = causal_empow.mean(dim=0)  # shape: (n_batch)
+                std_causal_empow_bonus = causal_empow_bonus.std(dim=0)  # shape: (n_batch)
 
+                rewards += self.causal_eta * causal_empow_bonus
 
-                # TODO: Implement the causal bonus
-                print("Implement the causal bonus")
-
-
-
-
+                if self.var_causal_bonus:
+                    rewards += self.var_causal_eta * std_causal_empow_bonus
 
             # We only continue rolling out for samples with active_mask == True
             # If the uncertainty is above threshold, we turn off that sample
