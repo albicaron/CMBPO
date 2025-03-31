@@ -64,7 +64,7 @@ class StructureLearning:
 
         self.bootstrap = bootstrap
 
-    def learn_dag(self, X, prior_knowledge=None, n_bootstrap=100):
+    def learn_dag(self, X, prior_knowledge=None, n_bootstrap=20):
 
         if self.sl_method == "PC":
             causal_matrix = self.pc_learn(X, prior_knowledge, n_bootstrap)
@@ -89,7 +89,7 @@ class StructureLearning:
 
         return p
 
-    def pc_learn(self, X, p=None, n_bootstrap=50):
+    def pc_learn(self, X, p=None, n_bootstrap=20):
 
         if self.bootstrap == 'standard':
 
@@ -144,7 +144,7 @@ class StructureLearning:
 
         return causal_matrix
 
-    def lingam_learn(self, X, p=None, n_bootstrap=100):
+    def lingam_learn(self, X, p=None, n_bootstrap=20):
 
         if self.bootstrap == 'standard':
 

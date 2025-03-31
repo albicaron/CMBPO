@@ -199,14 +199,14 @@ class MBPO_SAC:
 
     def train(self, num_episodes=100, max_steps=200):
         if self.log_wandb:
-            project_name = "SimpleCausalEnv_v1"
-            wandb.init(project=project_name, sync_tensorboard=True,
+            project_name = self.env.unwrapped.spec.id if hasattr(self.env, 'unwrapped') else 'SimpleCausalEnv'
+            wandb.init(project=project_name, sync_tensorboard=False,
                        name=f"{self.alg_name}_SAC_seed_{self.seed}_time_{time.time()}",
                        config=self.__dict__, group=self.alg_name, dir='/tmp')
 
         total_steps = 0
         for episode in range(num_episodes):
-            state, _ = self.env.reset()
+            state = self.env.reset()
             episode_reward = 0
             episode_steps = 0
 
@@ -218,7 +218,7 @@ class MBPO_SAC:
                 else:
                     action = self.env.action_space.sample()
 
-                next_state, reward, done, truncated, _ = self.env.step(action)
+                next_state, reward, done, _ = self.env.step(action)
 
                 self.real_buffer.push(state, action, reward, next_state, done)
 
@@ -228,7 +228,7 @@ class MBPO_SAC:
 
                 state = next_state
 
-                if done or truncated:
+                if done:
                     break
 
                 # 2) Second chunk: train the dynamics model and populate the imaginary buffer if self.model_based

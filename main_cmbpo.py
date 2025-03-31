@@ -3,6 +3,8 @@ import torch
 from envs.causal_env import SimpleCausalEnv
 from algs.cmbpo_sac import CMBPO_SAC
 
+import gym
+
 
 if __name__ == "__main__":
 
@@ -13,7 +15,8 @@ if __name__ == "__main__":
 
     log_wandb = False
     model_based = True
-    env = SimpleCausalEnv(shifted=False)
+    # env = SimpleCausalEnv(shifted=False)
+    env = gym.make('HalfCheetah-v4')
 
     agent = CMBPO_SAC(env, seed, device, log_wandb=log_wandb, model_based=model_based, pure_imaginary=False)
     agent.train(num_episodes=100, max_steps=200)

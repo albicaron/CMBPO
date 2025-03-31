@@ -16,9 +16,9 @@ torch.set_default_dtype(torch.float32)
 
 class CMBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True,
-                 sl_method="PC", bootstrap='standard', cgm_train_freq=1_000,
-                 causal_bonus=True, causal_eta=0.1, var_causal_bonus=False, var_causal_eta=0.1,
-                 jsd_thres=1.0, jsd_bonus=False, jsd_eta=0.1,
+                 sl_method="PC", bootstrap=None, cgm_train_freq=1_000,
+                 causal_bonus=True, causal_eta=0.01, var_causal_bonus=False, var_causal_eta=0.01,
+                 jsd_bonus=False, jsd_eta=0.1, jsd_thres=1.0,
                  lr_model=1e-3,
                  lr_sac=0.0003, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15, num_model_rollouts=400,  # Maybe put 100_000 as it is batched anyway
                  update_size=250, sac_train_freq=1, model_train_freq=100, batch_size=250):
@@ -189,12 +189,12 @@ class CMBPO_SAC:
 
                 causal_empow = compute_causal_emp(self.ensemble_model, causal_masks, current_states, self.sac_agent)
                 causal_empow_bonus = causal_empow.mean(dim=0)  # shape: (n_batch)
-                std_causal_empow_bonus = causal_empow_bonus.std(dim=0)  # shape: (n_batch)
+                std_causal_empow_bonus = causal_empow.std(dim=0)  # shape: (n_batch)
 
-                rewards += self.causal_eta * causal_empow_bonus
+                rewards += self.causal_eta * causal_empow_bonus.unsqueeze(1)
 
                 if self.var_causal_bonus:
-                    rewards += self.var_causal_eta * std_causal_empow_bonus
+                    rewards += self.var_causal_eta * std_causal_empow_bonus.unsqueeze(1)
 
             # We only continue rolling out for samples with active_mask == True
             # If the uncertainty is above threshold, we turn off that sample
@@ -224,6 +224,7 @@ class CMBPO_SAC:
 
         data_cgm = np.concatenate([state, action, next_state, reward], axis=1)
         self.est_cgm = self.local_cgm.learn_dag(data_cgm, prior_knowledge=self.pk)
+        # self.est_cgm = self.local_cgm.learn_dag(data_cgm)
 
         # Plot DAG at the end of the training
         if self.log_wandb and len(self.real_buffer) % 10_000 == 0:
@@ -268,14 +269,14 @@ class CMBPO_SAC:
 
     def train(self, num_episodes=100, max_steps=200):
         if self.log_wandb:
-            project_name = "SimpleCausalEnv_v1"
-            wandb.init(project=project_name, sync_tensorboard=True,
+            project_name = self.env.unwrapped.spec.id if hasattr(self.env, 'unwrapped') else 'SimpleCausalEnv'
+            wandb.init(project=project_name, sync_tensorboard=False,
                        name=f"{self.alg_name}_SAC_seed_{self.seed}_time_{time.time()}",
                        config=self.__dict__, group=self.alg_name, dir='/tmp')
 
         total_steps = 0
         for episode in range(num_episodes):
-            state, _ = self.env.reset()
+            state = self.env.reset()
             episode_reward = 0
             episode_steps = 0
 
@@ -287,7 +288,7 @@ class CMBPO_SAC:
                 else:
                     action = self.env.action_space.sample()
 
-                next_state, reward, done, truncated, _ = self.env.step(action)
+                next_state, reward, done, _ = self.env.step(action)
 
                 self.real_buffer.push(state, action, reward, next_state, done)
 
@@ -297,7 +298,7 @@ class CMBPO_SAC:
 
                 state = next_state
 
-                if done or truncated:
+                if done:
                     break
 
                 # 2) Second chunk: train the dynamics model and populate the imaginary buffer if self.model_based
@@ -319,7 +320,7 @@ class CMBPO_SAC:
                 # 4) Third chunk: train the SAC agent
                 if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
 
-                    for _ in range(5):
+                    for _ in range(1):
 
                         final_buffer = self.get_final_buffer()
                         critic_loss, actor_loss, alpha_loss = self.sac_agent.update(final_buffer, self.batch_size)

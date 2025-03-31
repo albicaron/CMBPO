@@ -48,7 +48,7 @@ class SimpleCausalEnv(gym.Env):
         """
         # Initialize S1 and S2 to random values, e.g., between -1 and 1
         self.state = np.random.uniform(low=-1.0, high=-1.0, size=(2,)).astype(np.float32)
-        return self.state, None
+        return self.state
 
     def step(self, action):
         """
