@@ -13,7 +13,8 @@ import random
 
 class MBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True, lr_model=1e-3,
-                 lr_sac=0.0003, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15, num_model_rollouts=400,  # Maybe put 100_000 as it is batched anyway
+                 lr_sac=0.0003, agent_steps=1, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15,
+                 num_model_rollouts=400,  # Maybe put 100_000 as it is batched anyway
                  update_size=250, sac_train_freq=1, model_train_freq=100, batch_size=250):
 
         self.env = env
@@ -35,6 +36,7 @@ class MBPO_SAC:
 
         self.update_size = update_size  # Size of the final buffer to train the SAC agent made of %5-95% real-imaginary
 
+        self.agent_steps = agent_steps
         self.sac_train_freq = sac_train_freq
         self.model_train_freq = model_train_freq
 
@@ -199,7 +201,7 @@ class MBPO_SAC:
 
     def train(self, num_episodes=100, max_steps=200):
         if self.log_wandb:
-            project_name = self.env.unwrapped.spec.id if hasattr(self.env, 'unwrapped') else 'SimpleCausalEnv'
+            project_name = self.env.unwrapped.spec.id if self.env.unwrapped.spec != None else 'SimpleCausalEnv'
             wandb.init(project=project_name, sync_tensorboard=False,
                        name=f"{self.alg_name}_SAC_seed_{self.seed}_time_{time.time()}",
                        config=self.__dict__, group=self.alg_name, dir='/tmp')
@@ -243,7 +245,7 @@ class MBPO_SAC:
                 # 3) Third chunk: train the SAC agent
                 if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
 
-                    for _ in range(5):
+                    for _ in range(self.agent_steps):
 
                         final_buffer = self.get_final_buffer()
                         critic_loss, actor_loss, alpha_loss = self.sac_agent.update(final_buffer, self.batch_size)

@@ -126,7 +126,7 @@ class StructureLearning:
                 X_bayes = X[indices, :]
 
                 # Learn graph on Bayes bootstrap sample with the prior knowledge
-                pc = PC(priori_knowledge=p)
+                pc = PC(priori_knowledge=p, alpha=0.01)
                 pc.learn(X_bayes)
 
                 # Aggregate (here simply summing the binary matrices)
@@ -205,8 +205,56 @@ class StructureLearning:
         np.fill_diagonal(causal_mask, 0)
         return causal_mask
 
-    def plot_dag(self, predict_dag, true_dag, save_name=None):
-        GraphDAG(predict_dag, true_dag, show=False, save_name=save_name)
+    def plot_dag(self, predict_dag, true_dag, save_name=None, labels=None, figsize=(12, 5), cmap_true='Blues',
+                 cmap_pred='Oranges'):
+        """
+        Plot predicted and true DAGs as adjacency matrices side by side using Matplotlib only.
+
+        Args:
+            predict_dag (np.ndarray): Predicted DAG adjacency matrix.
+            true_dag (np.ndarray): Ground truth DAG adjacency matrix.
+            save_name (str): Optional filename to save the plot.
+            labels (list of str): Optional list of labels for the axes.
+            figsize (tuple): Size of the full figure.
+            cmap_true (str): Colormap for the true DAG.
+            cmap_pred (str): Colormap for the predicted DAG.
+        """
+        assert predict_dag.shape == true_dag.shape, "predict_dag and true_dag must have the same shape"
+        n = predict_dag.shape[0]
+        vmax = max(np.max(predict_dag), np.max(true_dag), 1)
+
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+        # Plot true DAG
+        im1 = axes[0].imshow(true_dag, cmap=cmap_true, vmin=0, vmax=vmax)
+        axes[0].set_title("True DAG")
+        axes[0].set_xticks(range(n))
+        axes[0].set_yticks(range(n))
+        if labels:
+            axes[0].set_xticklabels(labels, rotation=90)
+            axes[0].set_yticklabels(labels)
+        fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+
+        # Plot predicted DAG
+        im2 = axes[1].imshow(predict_dag, cmap=cmap_pred, vmin=0, vmax=vmax)
+        axes[1].set_title("Predicted DAG")
+        axes[1].set_xticks(range(n))
+        axes[1].set_yticks(range(n))
+        if labels:
+            axes[1].set_xticklabels(labels, rotation=90)
+            axes[1].set_yticklabels(labels)
+        fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+
+        # if save_name:
+        #     plt.savefig(save_name, dpi=300, bbox_inches='tight')
+        #     print(f"Plot saved to {save_name}")
+        # else:
+        #     plt.show()
+
+        # Return the figure
+        return fig
 
     def calculate_metrics(self, predict_dag, true_dag):
         mt = MetricsDAG(predict_dag, true_dag)

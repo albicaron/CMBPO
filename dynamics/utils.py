@@ -38,7 +38,6 @@ def compute_jsd(means, var_s):
 
 
 def compute_causal_emp(deep_ensemble,
-                       causal_masks,
                        current_states,
                        policy,
                        n_action_samples=50,
@@ -71,31 +70,27 @@ def compute_causal_emp(deep_ensemble,
         model_input = torch.cat([current_states, action_i], dim=1)
 
         with torch.no_grad():
+            mean_preds, logvar_preds = deep_ensemble(model_input)
+        all_preds_mean = torch.stack([torch.stack(group, dim=0).squeeze(-1) for group in mean_preds], dim=0)
+        all_preds_var = torch.stack([torch.stack(group, dim=0).squeeze(-1) for group in logvar_preds], dim=0)
 
-            # Here for each target variable in (ns, r), we multiply the parent causal mask
-            all_preds_mean = torch.zeros(n_ens, n_batch, n_sts + 1)
-            all_preds_var = torch.zeros(n_ens, n_batch, n_sts + 1)
-
-            # Loop over the target variables
-            for i in range(deep_ensemble.state_dim + 1):
-                masked_inputs = model_input * causal_masks[:, :, i]
-                mean_pred_i, logvar_pred_i = deep_ensemble(masked_inputs)
-                mean_pred_i, logvar_pred_i = torch.stack(mean_pred_i, dim=0), torch.stack(logvar_pred_i, dim=0)
-                all_preds_mean[:, :, i], all_preds_var[:, :, i] = mean_pred_i[:, :, i], logvar_pred_i[:, :, i]
+        # Swap axes to [n_ens, n_batch, n_dim]
+        all_preds_mean = all_preds_mean.permute(1, 2, 0)  # shape: (n_batch, d_state, n_ens)
+        all_preds_var = all_preds_var.permute(1, 2, 0)  # shape: (n_batch, d_state, n_ens)
 
         means_all_acts.append(all_preds_mean)
         logvars_all_acts.append(all_preds_var)
 
-    means_all_acts = torch.stack(means_all_acts, dim=0)  # shape: (n_ens, n_action_samples, n_batch, d_state)
-    logvars_all_acts = torch.stack(logvars_all_acts, dim=0)  # shape: (n_ens, n_action_samples, n_batch, d_state)
+    means_all_acts = torch.stack(means_all_acts, dim=1)  # shape: (n_ens, n_action_samples, n_batch, d_state)
+    logvars_all_acts = torch.stack(logvars_all_acts, dim=1)  # shape: (n_ens, n_action_samples, n_batch, d_state)
     vars_all_acts = torch.exp(logvars_all_acts)
 
     # 2) Compute conditional entropy E_{a}[ H(s'| s,a) ]
     entr_per_dim = gaussian_1d_entropy(vars_all_acts)
-    cond_entr = entr_per_dim.sum(dim=-1)  # shape: (n_action_samples, n_ens, n_batch)
+    cond_entr = entr_per_dim.sum(dim=-1)  # shape: (n_ens, n_action_samples, n_batch)
 
     # Average over actions
-    cond_entr_mean = cond_entr.mean(dim=0)  # shape: (n_ens, n_batch)
+    cond_entr_mean = cond_entr.mean(dim=1)  # shape: (n_ens, n_batch)
 
     # 3) Approximate H(s'| s) by a mixture of Gaussians: p(r, s'| s) ~ (1/n_action) sum_i=1..n_action p(r,s'| s,a_i)
     # Compute this for each ensemble member k
@@ -106,8 +101,8 @@ def compute_causal_emp(deep_ensemble,
 
         # means_k => shape (n_action_samples, B, D)
         # vars_k  => shape (n_action_samples, B, D)
-        means_k = means_all_acts[:, k, :, :]
-        vars_k = vars_all_acts[:, k, :, :]
+        means_k = means_all_acts[k, :, :, :]
+        vars_k = vars_all_acts[k, :, :, :]
 
         # TODO: This is the computational bottleneck
         # We're vectorizing the computation across the batch dimension

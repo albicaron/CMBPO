@@ -6,12 +6,12 @@ import time
 # Just run a random policy on the environment
 if __name__ == "__main__":
 
-    seed = 3
+    seed = 4
     num_episodes = 100
     max_steps = 200
 
-    project_name = "SimpleCausalEnv_v1"
-    wandb.init(project=project_name, sync_tensorboard=True,
+    project_name = "SimpleCausalEnv"
+    wandb.init(project=project_name, sync_tensorboard=False,
                name=f"RANDOM_seed_{seed}_time_{time.time()}",
                group="Random", dir='/tmp', config={"alg_name": "Random"})
 
@@ -25,13 +25,13 @@ if __name__ == "__main__":
 
         for step in range(max_steps):
             action = env.action_space.sample()
-            next_state, reward, done, truncated, _ = env.step(action)
+            next_state, reward, done, _ = env.step(action)
 
             episode_reward += reward
             episode_steps += 1
 
             state = next_state
-            if done or truncated:
+            if done:
                 break
 
         wandb.log({

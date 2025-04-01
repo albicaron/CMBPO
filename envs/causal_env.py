@@ -86,7 +86,7 @@ class SimpleCausalEnv(gym.Env):
         # Define termination condition (optional)
         done = False
 
-        return self.state, R_t, done, False, None
+        return self.state, R_t, done, False
 
     def get_adj_matrix(self):
         """
@@ -99,9 +99,9 @@ class SimpleCausalEnv(gym.Env):
         adj_matrix = np.zeros((6, 6))
         adj_matrix[0, 1] = 1  # S1 -> S2
         adj_matrix[0, 3] = 1  # S1 -> S1'
+        adj_matrix[0, 5] = 1  # S1 -> R
         adj_matrix[2, 3] = 1  # A -> S1'
-        adj_matrix[3, 4] = 1  # S1' -> S2'
-        adj_matrix[3, 5] = 1  # S1' -> R
+        # adj_matrix[3, 4] = 1  # S1' -> S2'
 
         return adj_matrix
 

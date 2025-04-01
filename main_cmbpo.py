@@ -9,14 +9,14 @@ import gym
 if __name__ == "__main__":
 
     # Initialize environment
-    seed = 2
+    seed = 0
     torch.manual_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    log_wandb = False
+    log_wandb = True
     model_based = True
-    # env = SimpleCausalEnv(shifted=False)
-    env = gym.make('HalfCheetah-v4')
+    env = SimpleCausalEnv(shifted=False)
+    # env = gym.make('HalfCheetah-v4')
 
     agent = CMBPO_SAC(env, seed, device, log_wandb=log_wandb, model_based=model_based, pure_imaginary=False)
     agent.train(num_episodes=100, max_steps=200)

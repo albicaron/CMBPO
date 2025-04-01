@@ -5,7 +5,8 @@ import numpy as np
 from algs.sac import SAC, ReplayBuffer
 from dynamics.causal_models import StructureLearning, set_p_matrix
 from dynamics.utils import compute_jsd, compute_causal_emp
-from dynamics.dynamics_models import EnsembleModel
+from dynamics.causal_dynamics_models import FactorizedEnsembleModel
+import matplotlib.pyplot as plt
 
 import wandb
 import time
@@ -16,11 +17,12 @@ torch.set_default_dtype(torch.float32)
 
 class CMBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True,
-                 sl_method="PC", bootstrap=None, cgm_train_freq=1_000,
-                 causal_bonus=True, causal_eta=0.01, var_causal_bonus=False, var_causal_eta=0.01,
+                 sl_method="PC", bootstrap=None, n_bootstrap=10, cgm_train_freq=1_000,
+                 causal_bonus=False, causal_eta=0.01, var_causal_bonus=False, var_causal_eta=0.01,
                  jsd_bonus=False, jsd_eta=0.1, jsd_thres=1.0,
                  lr_model=1e-3,
-                 lr_sac=0.0003, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15, num_model_rollouts=400,  # Maybe put 100_000 as it is batched anyway
+                 lr_sac=0.0003, agent_steps=1, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15,
+                 num_model_rollouts=400,  # Maybe put 100_000 as it is batched anyway
                  update_size=250, sac_train_freq=1, model_train_freq=100, batch_size=250):
 
         self.env = env
@@ -28,7 +30,7 @@ class CMBPO_SAC:
         self.log_wandb = log_wandb
         self.model_based = model_based
         self.pure_imaginary = pure_imaginary
-        self.alg_name = 'CMBPO_SAC' if self.model_based else 'SAC'
+        self.alg_name = f"CMBPO_SAC_{sl_method}_boot{str(bootstrap)}_ce{str(causal_bonus)}_varce{str(var_causal_bonus)}"
 
         self.state_dim = env.observation_space.shape[0]
         self.action_dim = env.action_space.shape[0]
@@ -42,6 +44,7 @@ class CMBPO_SAC:
 
         self.update_size = update_size  # Size of the final buffer to train the SAC agent made of %5-95% real-imaginary
 
+        self.agent_steps = agent_steps
         self.sac_train_freq = sac_train_freq
         self.model_train_freq = model_train_freq
 
@@ -52,8 +55,8 @@ class CMBPO_SAC:
         self.sac_agent = SAC(self.state_dim, self.action_dim, self.max_action, lr=lr_sac, gamma=gamma,
                              tau=tau, alpha=alpha, device=self.device)
 
-        self.ensemble_model = EnsembleModel(state_dim=self.state_dim, action_dim=self.action_dim, lr=lr_model,
-                                            ensemble_size=5).to(self.device)
+        self.ensemble_model = FactorizedEnsembleModel(state_dim=self.state_dim, action_dim=self.action_dim, lr=lr_model,
+                                                      ensemble_size=10).to(self.device)
 
         self.real_buffer = ReplayBuffer(int(10_000))
         self.imaginary_buffer = ReplayBuffer(int(10_000))
@@ -63,10 +66,17 @@ class CMBPO_SAC:
         # Causal MBPO specific
         self.sl_method = sl_method
         self.bootstrap = bootstrap
+        self.n_bootstrap = n_bootstrap
         self.cgm_train_freq = cgm_train_freq
         self.local_cgm = StructureLearning(n_nodes=self.state_dim + self.action_dim + self.state_dim + 1,
                                            sl_method=sl_method, bootstrap=bootstrap)
         self.p_matrix = set_p_matrix(self.state_dim, self.action_dim)
+
+        # # In SimpleCausalEnv, allow to learn same time state depencencies
+        # if self.env.unwrapped.spec is None:
+        #     self.p_matrix[:self.state_dim, :self.state_dim] = -1
+        #     # self.p_matrix[self.state_dim + self.action_dim:, self.state_dim + self.action_dim:] = -1  # Also for S'?
+
         self.pk = self.local_cgm.set_prior_knowledge(p_matrix=self.p_matrix)
 
         # Initialize the estimated CGM as a fully connected graph
@@ -79,32 +89,9 @@ class CMBPO_SAC:
 
     def update_model(self, batch_size=256, epochs=50):
 
-        for _ in range(epochs):
+        model_loss = self.ensemble_model.train_factorized_ensemble(self.real_buffer, batch_size, epochs)
 
-            state, action, reward, next_state, done = self.real_buffer.sample(batch_size)
-
-            state = torch.FloatTensor(state).to(self.device)
-            action = torch.FloatTensor(action).to(self.device)
-            next_state = torch.FloatTensor(next_state).to(self.device)
-            reward = torch.FloatTensor(reward).to(self.device).unsqueeze(1)
-
-            model_input = torch.cat([state, action], dim=1)
-            next_s_rew = torch.cat([next_state, reward], dim=1)
-
-            # Normalize the inputs
-            mean_preds, logvar_preds = self.ensemble_model(model_input)
-
-            model_loss = 0
-            self.ensemble_model.model_optimizer.zero_grad()
-            for mean_pred, logvar_pred in zip(mean_preds, logvar_preds):
-
-                var_pred = torch.exp(logvar_pred)
-                model_loss += F.gaussian_nll_loss(mean_pred, next_s_rew, var_pred)
-
-            model_loss.backward()
-            self.ensemble_model.model_optimizer.step()
-
-        return model_loss.item()
+        return model_loss
 
     def counterfact_rollout(self):
         """
@@ -141,11 +128,6 @@ class CMBPO_SAC:
 
         current_states = initial_states.clone().numpy()
 
-        # Sample a causal graph mask for each sample in the batch, for each in parents (ns, r)
-        sub_cgm_matrix = self.est_cgm[:(self.state_dim + self.action_dim), (self.state_dim + self.action_dim):]
-        sub_cgm_matrix = torch.FloatTensor(sub_cgm_matrix).to(self.device)
-        causal_masks = torch.bernoulli(sub_cgm_matrix.unsqueeze(0).repeat(num_samples, 1, 1))
-
         for t in range(max_length_traj):
 
             # If everything is "inactive", exit early
@@ -159,20 +141,16 @@ class CMBPO_SAC:
 
             # Ensemble predictions: shape [ensemble_size, batch_size, next_state_dim+1]
             with torch.no_grad():
+                mean_preds, logvar_preds = self.ensemble_model(model_input)
+            all_preds_mean = torch.stack([torch.stack(group, dim=0).squeeze(-1) for group in mean_preds], dim=0)
+            all_preds_var = torch.stack([torch.stack(group, dim=0).squeeze(-1) for group in logvar_preds], dim=0)
 
-                # Here for each target variable in (ns, r), we multiply the parent causal mask
-                # to get the parents of each target variable
-                all_preds_mean = torch.zeros(self.ensemble_model.ensemble_size, num_samples, self.state_dim + 1)
-                all_preds_var = torch.zeros(self.ensemble_model.ensemble_size, num_samples, self.state_dim + 1)
-
-                # Loop over the target variables
-                for i in range(self.state_dim + 1):
-                    masked_inputs = model_input * causal_masks[:, :, i]
-                    mean_pred_i, logvar_pred_i = self.ensemble_model(masked_inputs)
-                    mean_pred_i, logvar_pred_i = torch.stack(mean_pred_i, dim=0), torch.stack(logvar_pred_i, dim=0)
-                    all_preds_mean[:, :, i], all_preds_var[:, :, i] = mean_pred_i[:, :, i], logvar_pred_i[:, :, i]
+            # Swap axes to [n_ens, n_batch, n_dim]
+            all_preds_mean = all_preds_mean.permute(1, 2, 0)
+            all_preds_var = all_preds_var.permute(1, 2, 0)
 
             # Next state is sampled from the ensemble
+            # TODO:  NB, Here we can also pick a single ensemble member - graph-based
             ensemble_idx = torch.randint(self.ensemble_model.ensemble_size, (1,)).item()
             mean_pred, log_var_pred = all_preds_mean[ensemble_idx], all_preds_var[ensemble_idx]
             next_states = mean_pred[:, :-1]
@@ -187,7 +165,8 @@ class CMBPO_SAC:
 
             if self.causal_bonus:
 
-                causal_empow = compute_causal_emp(self.ensemble_model, causal_masks, current_states, self.sac_agent)
+                # TODO: Here the mixture still creates a bit of computational bottleneck
+                causal_empow = compute_causal_emp(self.ensemble_model, current_states, self.sac_agent)
                 causal_empow_bonus = causal_empow.mean(dim=0)  # shape: (n_batch)
                 std_causal_empow_bonus = causal_empow.std(dim=0)  # shape: (n_batch)
 
@@ -223,12 +202,18 @@ class CMBPO_SAC:
         reward = reward.reshape(-1, 1)
 
         data_cgm = np.concatenate([state, action, next_state, reward], axis=1)
-        self.est_cgm = self.local_cgm.learn_dag(data_cgm, prior_knowledge=self.pk)
-        # self.est_cgm = self.local_cgm.learn_dag(data_cgm)
+        self.est_cgm = self.local_cgm.learn_dag(data_cgm,
+                                                # prior_knowledge=self.pk,
+                                                n_bootstrap=self.n_bootstrap)
+
+        # Set parents of (s, a) to (ns, r) to -1
+        self.ensemble_model.set_parents_from_prob_matrix(self.est_cgm)
 
         # Plot DAG at the end of the training
-        if self.log_wandb and len(self.real_buffer) % 10_000 == 0:
-            self.local_cgm.plot_dag(self.est_cgm, self.true_cgm, save_name=f"Estimated CGM at {len(self.real_buffer)} samples")
+        if self.log_wandb and len(self.real_buffer) % 1_000 == 0:
+            fig = self.local_cgm.plot_dag(self.est_cgm, self.true_cgm)
+            wandb.log({"Train/Estimated CGM": wandb.Image(fig)})
+            plt.close(fig)
 
     def get_final_buffer(self):
 
@@ -269,7 +254,7 @@ class CMBPO_SAC:
 
     def train(self, num_episodes=100, max_steps=200):
         if self.log_wandb:
-            project_name = self.env.unwrapped.spec.id if hasattr(self.env, 'unwrapped') else 'SimpleCausalEnv'
+            project_name = self.env.unwrapped.spec.id if self.env.unwrapped.spec != None else 'SimpleCausalEnv'
             wandb.init(project=project_name, sync_tensorboard=False,
                        name=f"{self.alg_name}_SAC_seed_{self.seed}_time_{time.time()}",
                        config=self.__dict__, group=self.alg_name, dir='/tmp')
@@ -320,7 +305,7 @@ class CMBPO_SAC:
                 # 4) Third chunk: train the SAC agent
                 if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
 
-                    for _ in range(1):
+                    for _ in range(self.agent_steps):
 
                         final_buffer = self.get_final_buffer()
                         critic_loss, actor_loss, alpha_loss = self.sac_agent.update(final_buffer, self.batch_size)
