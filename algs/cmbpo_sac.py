@@ -17,8 +17,8 @@ torch.set_default_dtype(torch.float32)
 
 class CMBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True,
-                 sl_method="PC", bootstrap=None, n_bootstrap=10, cgm_train_freq=1_000,
-                 causal_bonus=False, causal_eta=0.01, var_causal_bonus=False, var_causal_eta=0.01,
+                 sl_method="PC", bootstrap='bayesian', n_bootstrap=10, cgm_train_freq=2_500,
+                 causal_bonus=False, causal_eta=0.1, var_causal_bonus=False, var_causal_eta=0.01,
                  jsd_bonus=False, jsd_eta=0.1, jsd_thres=1.0,
                  lr_model=1e-3,
                  lr_sac=0.0003, agent_steps=1, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15,
@@ -87,7 +87,7 @@ class CMBPO_SAC:
         self.causal_bonus, self.causal_eta = causal_bonus, causal_eta
         self.var_causal_bonus, self.var_causal_eta = var_causal_bonus, var_causal_eta
 
-    def update_model(self, batch_size=256, epochs=50):
+    def update_model(self, batch_size=256, epochs=100):  # We increase epochs to 100 as we have state_dim+1 models
 
         model_loss = self.ensemble_model.train_factorized_ensemble(self.real_buffer, batch_size, epochs)
 
@@ -124,9 +124,12 @@ class CMBPO_SAC:
 
         # Let us define a hyperparameter or heuristic threshold for "too high" variance
         # In practice, you can tune this threshold or make it adapt over time.
-        jsd_threshold = 1.0  # or any other measure you want
+        jsd_threshold = 0.5  # or any other measure you want
 
         current_states = initial_states.clone().numpy()
+
+        # Sample an ensemble index for each sample in the batch, to use consistent ensemble members for each rollout
+        ensemble_idx = torch.randint(self.ensemble_model.ensemble_size, (num_samples,))
 
         for t in range(max_length_traj):
 
@@ -149,10 +152,14 @@ class CMBPO_SAC:
             all_preds_mean = all_preds_mean.permute(1, 2, 0)
             all_preds_var = all_preds_var.permute(1, 2, 0)
 
-            # Next state is sampled from the ensemble
-            # TODO:  NB, Here we can also pick a single ensemble member - graph-based
-            ensemble_idx = torch.randint(self.ensemble_model.ensemble_size, (1,)).item()
-            mean_pred, log_var_pred = all_preds_mean[ensemble_idx], all_preds_var[ensemble_idx]
+            # Next state is sampled from the ensemble according to the ensemble_idx previously sampled outside the loop
+            # TODO:  NB, Here we pick a single ensemble member for each batch sample to keep consistent graphs
+            # ensemble_idx = torch.randint(self.ensemble_model.ensemble_size, (1,)).item()
+            # mean_pred, log_var_pred = all_preds_mean[ensemble_idx], all_preds_var[ensemble_idx]
+
+            batch_idx = torch.arange(num_samples, device=self.device)
+            mean_pred = all_preds_mean[ensemble_idx, batch_idx]
+
             next_states = mean_pred[:, :-1]
             rewards = mean_pred[:, -1].unsqueeze(1)
             dones = torch.zeros_like(rewards)
@@ -203,7 +210,7 @@ class CMBPO_SAC:
 
         data_cgm = np.concatenate([state, action, next_state, reward], axis=1)
         self.est_cgm = self.local_cgm.learn_dag(data_cgm,
-                                                # prior_knowledge=self.pk,
+                                                prior_knowledge=self.pk,
                                                 n_bootstrap=self.n_bootstrap)
 
         # Set parents of (s, a) to (ns, r) to -1
@@ -254,7 +261,7 @@ class CMBPO_SAC:
 
     def train(self, num_episodes=100, max_steps=200):
         if self.log_wandb:
-            project_name = self.env.unwrapped.spec.id if self.env.unwrapped.spec != None else 'SimpleCausalEnv'
+            project_name = self.env.unwrapped.spec.id if self.env.unwrapped.spec != None else 'SimpleCausal_Multi'
             wandb.init(project=project_name, sync_tensorboard=False,
                        name=f"{self.alg_name}_SAC_seed_{self.seed}_time_{time.time()}",
                        config=self.__dict__, group=self.alg_name, dir='/tmp')

@@ -1,21 +1,23 @@
 import torch
-from envs.causal_env import SimpleCausalEnv
+# from envs.causal_env import SimpleCausalEnv
+from envs.causal_env_multiaction import SimpleCausal_Multi
 import wandb
 import time
 
 # Just run a random policy on the environment
 if __name__ == "__main__":
 
-    seed = 4
+    seed = 0
     num_episodes = 100
     max_steps = 200
 
-    project_name = "SimpleCausalEnv"
+    project_name = "SimpleCausal_Multi"
     wandb.init(project=project_name, sync_tensorboard=False,
                name=f"RANDOM_seed_{seed}_time_{time.time()}",
                group="Random", dir='/tmp', config={"alg_name": "Random"})
 
-    env = SimpleCausalEnv(shifted=False)
+    # env = SimpleCausalEnv(shifted=False)
+    env = SimpleCausal_Multi(shifted=False)
 
     for episode in range(num_episodes):
 

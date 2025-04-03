@@ -194,7 +194,10 @@ class StructureLearning:
 
         else:
             # No bootstrap
-            lingam = DirectLiNGAM(prior_knowledge=p.matrix)
+            try:
+                lingam = DirectLiNGAM(prior_knowledge=p.matrix)
+            except AttributeError:
+                lingam = DirectLiNGAM()
             lingam.learn(X)
             causal_matrix = lingam.causal_matrix
 

@@ -1,6 +1,7 @@
 import torch
 
-from envs.causal_env import SimpleCausalEnv
+# from envs.causal_env import SimpleCausalEnv
+from envs.causal_env_multiaction import SimpleCausal_Multi
 from algs.cmbpo_sac import CMBPO_SAC
 
 import gym
@@ -15,7 +16,7 @@ if __name__ == "__main__":
 
     log_wandb = True
     model_based = True
-    env = SimpleCausalEnv(shifted=False)
+    env = SimpleCausal_Multi(shifted=False)
     # env = gym.make('HalfCheetah-v4')
 
     agent = CMBPO_SAC(env, seed, device, log_wandb=log_wandb, model_based=model_based, pure_imaginary=False)

@@ -29,7 +29,7 @@ def compute_jsd(means, var_s):
 
     # mean of entropies
     total_entropy = torch.sum(torch.log(var), dim=-1)                     # shape: (n_actors, ensemble_size)
-    mean_entropy = total_entropy.mean(dim=1) / 2 + d_s * np.log(2.) / 2    # shape: (n_actors)
+    mean_entropy = total_entropy.mean(dim=1) / 2 + d_s * np.log(2.) / 2   # shape: (n_actors)
 
     # jensen-shannon divergence
     jsd = entropy_mean - mean_entropy                                 # shape: (n_actors)

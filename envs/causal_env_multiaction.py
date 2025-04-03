@@ -3,24 +3,25 @@ from gym import spaces
 import numpy as np
 
 
-class SimpleCausalEnv(gym.Env):
+class SimpleCausal_Multi(gym.Env):
     """
-    A simple RL environment with two state variables S1 and S2.
+    A simple causal RL environment with two state variables S1 and S2, and actions A_1 and A_2
     Dynamics:
-        X_{t+1) = 0.3 * X_t + 0.8 A_t - 0.2 * cos(0.5 * X_t) + e1_t  # Depends on: X_t, A_t
-        Z_{t+1} = X_{t+1} + e2_t  # Depends on: X_{t+1}
-        R_t = 0.5 * X_t + e3_t - 0.01  # Reward depends on: X_t
+        S1_{t+1) = S1_t + 0.8*A_1 + e1_t  # Depends on: S1_t, A_1
+        S2_{t+1} = S2_t + 0.8*A_2 + e2_t  # Depends on: S2_t, A_2
+
+        R_t = 0.5 * S2_t + e3_t - 0.01  # Reward depends on: S1_t
     Actions are continuous in [-1, 1]
     """
 
     def __init__(self, noise_std=.01, shifted=False):
-        super(SimpleCausalEnv, self).__init__()
+        super(SimpleCausal_Multi, self).__init__()
 
         self.shifted = shifted
 
         # Define action and observation space
-        # Continuous action space: A_t ∈ [-1, 1]
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
+        # Continuous action space: A1_t, A2_t ∈ [-1, 1]
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
         # Observation space: S1_t and S2_t. Setting reasonable bounds for the state variables
         # high = np.array([np.finfo(np.float32).max, np.finfo(np.float32).max], dtype=np.float32)
@@ -36,7 +37,7 @@ class SimpleCausalEnv(gym.Env):
         self.noise_std = noise_std  # Standard deviation of the noise
 
         # Causal strength parameters
-        self.power = 0.05
+        self.power = 0.01
         self.friction = 0.005
         self.slope = 0.05
 
@@ -54,31 +55,31 @@ class SimpleCausalEnv(gym.Env):
         """
         Execute one time step within the environment.
         """
-        X_t, Z_t = self.state
-        A_t = action[0]
+        S1_t, S2_t = self.state
+        A1_t, A2_t = action
 
         # Ensure action is within the valid range
-        A_t = np.clip(A_t, self.action_space.low[0], self.action_space.high[0])
+        A1_t = np.clip(A1_t, self.action_space.low[0], self.action_space.high[0])
+        A2_t = np.clip(A2_t, self.action_space.low[1], self.action_space.high[1])
 
         # Define the non-linear functions
-        f_x = X_t + self.power * A_t - self.friction * np.cos(self.slope * X_t)
-        f_z = 0.0*f_x if self.shifted else f_x
-        # f_z = -f_x if self.shifted else f_x  # Larger shift
+        f_s1 = S1_t + self.power * A1_t - self.friction * np.cos(self.slope * S1_t)
+        f_s2 = S2_t + self.power * A2_t - self.friction * np.sin(self.slope * S2_t)
 
         # Generate noise
-        e_x_t = np.random.normal(0, self.noise_std)
-        e_z_t = np.random.normal(0, self.noise_std)  # Shift in the marginal distribution of Z
+        e_s1_t = np.random.normal(0, self.noise_std)
+        e_s2_t = np.random.normal(0, self.noise_std)  # Shift in the marginal distribution of Z
         e_r_t = np.random.normal(0, self.noise_std)
 
         # Compute next state by adding the noise
-        next_X_t = f_x + e_x_t
-        next_Z_t = f_z + e_z_t
+        next_S1_t = f_s1 + e_s1_t
+        next_S2_t = f_s2 + e_s2_t
 
         # Compute reward
-        R_t = 0.1*(1.0 - X_t**2) + e_r_t
+        R_t = 0.1*(1.0 - S2_t**2) + e_r_t
 
         # Update the state
-        self.state = np.array([next_X_t, next_Z_t], dtype=np.float32)
+        self.state = np.array([next_S1_t, next_S2_t], dtype=np.float32)
 
         # Clip the state to the valid range
         self.state = np.clip(self.state, self.observation_space.low, self.observation_space.high)
@@ -91,17 +92,15 @@ class SimpleCausalEnv(gym.Env):
     def get_adj_matrix(self):
         """
         Return the adjacency matrix of the causal graph underlying the environment dynamics and rewards of the
-        (s,a,ns,r) tuples. Which means this is a 6x6 matrix where the first 2 rows and columns correspond to the
-        state variables S1 and S2, the next 2 rows and columns correspond to the action variable A and the next 2 rows
-        and columns correspond to the next state variables S1' and S2' and the reward variable R. No self-loops
+        (s,a,ns,r) tuples. Which means this is a 7x7 matrix with the following structure:
         :return:
         """
-        adj_matrix = np.zeros((6, 6))
-        adj_matrix[0, 1] = 1  # S1 -> S2
-        adj_matrix[0, 3] = 1  # S1 -> S1'
-        adj_matrix[0, 5] = 1  # S1 -> R
-        adj_matrix[2, 3] = 1  # A -> S1'
-        # adj_matrix[3, 4] = 1  # S1' -> S2'
+        adj_matrix = np.zeros((7, 7))
+        adj_matrix[0, 4] = 1  # S1 -> S1'
+        adj_matrix[1, 5] = 1  # S2 -> S2'
+        adj_matrix[1, 6] = 1  # S2 -> R
+        adj_matrix[2, 4] = 1  # A1 -> S1'
+        adj_matrix[3, 5] = 1  # A2 -> S2'
 
         return adj_matrix
 
@@ -120,13 +119,13 @@ class SimpleCausalEnv(gym.Env):
 
 if __name__ == "__main__":
     # Test the non-shifted environment
-    env = SimpleCausalEnv()
+    env = SimpleCausal_Multi()
     state = env.reset()
     print("\n\nNon-shifted environment:")
     print("Initial state:", state)
 
     for i in range(200):
-        action = np.array([1.0], dtype=np.float32)
+        action = np.array([1.0, 1.0], dtype=np.float32)
         next_state, reward, done, _ = env.step(action)
         if i % 10 == 0:
             print("Action:", action, "Next state:", next_state, "Reward:", reward)
@@ -134,15 +133,4 @@ if __name__ == "__main__":
             break
 
     # Test the shifted environment
-    env = SimpleCausalEnv(shifted=True)
-    state = env.reset()
-    print("\n\nShifted environment:")
-    print("Initial state:", state)
-
-    for i in range(200):
-        action = np.array([1.0], dtype=np.float32)
-        next_state, reward, done, _ = env.step(action)
-        if i % 10 == 0:
-            print("Action:", action, "Next state:", next_state, "Reward:", reward)
-        if done:
-            break
+    # TODO
