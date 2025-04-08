@@ -180,6 +180,25 @@ def compute_causal_emp(deep_ensemble,
     return causal_empow
 
 
+
+def compute_path_ce(local_cgm,
+                    deep_ensemble,
+                    current_states,
+                    policy,
+                    n_action_samples=50,
+                    n_mixture_samples=100):
+    """
+    This function first gathers the indexes of the states S^j such that they satisfy the path A -> S^j -> R, in the
+    local_cgm. Then, it computes the empowerment of the states S^j using the compute_causal_emp function.
+    """
+
+    # Get the indexes of the states S^j such that they satisfy the path A -> S^j -> R
+    # in the local_cgm
+    path_indexes = []
+
+
+
+
 def gaussian_1d_entropy(var_1d):
     """
     Differential entropy for a 1D Gaussian N(., var_1d):

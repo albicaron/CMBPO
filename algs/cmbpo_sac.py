@@ -4,7 +4,7 @@ import numpy as np
 
 from algs.sac import SAC, ReplayBuffer
 from dynamics.causal_models import StructureLearning, set_p_matrix
-from dynamics.utils import compute_jsd, compute_causal_emp
+from dynamics.utils import compute_jsd, compute_causal_emp, compute_path_ce
 from dynamics.causal_dynamics_models import FactorizedEnsembleModel
 import matplotlib.pyplot as plt
 
@@ -17,8 +17,8 @@ torch.set_default_dtype(torch.float32)
 
 class CMBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True,
-                 sl_method="PC", bootstrap='bayesian', n_bootstrap=10, cgm_train_freq=2_500,
-                 causal_bonus=False, causal_eta=0.1, var_causal_bonus=False, var_causal_eta=0.01,
+                 sl_method="PC", bootstrap='standard', n_bootstrap=100, cgm_train_freq=3_000,
+                 causal_bonus=True, causal_eta=0.1, var_causal_bonus=False, var_causal_eta=0.01,
                  jsd_bonus=False, jsd_eta=0.1, jsd_thres=1.0,
                  lr_model=1e-3,
                  lr_sac=0.0003, agent_steps=1, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15,
@@ -173,7 +173,9 @@ class CMBPO_SAC:
             if self.causal_bonus:
 
                 # TODO: Here the mixture still creates a bit of computational bottleneck
-                causal_empow = compute_causal_emp(self.ensemble_model, current_states, self.sac_agent)
+                # causal_empow = compute_causal_emp(self.ensemble_model, current_states, self.sac_agent)
+                causal_empow = compute_path_ce(self.est_cgm, self.ensemble_model,
+                                               current_states, self.sac_agent)
                 causal_empow_bonus = causal_empow.mean(dim=0)  # shape: (n_batch)
                 std_causal_empow_bonus = causal_empow.std(dim=0)  # shape: (n_batch)
 
@@ -304,7 +306,8 @@ class CMBPO_SAC:
                         self.counterfact_rollout()
 
                 # 3) Learn Local Causal Graphical Model from the real buffer
-                if total_steps % self.cgm_train_freq == 0:
+                # if total_steps % self.cgm_train_freq == 0:  # Learn every self.cgm_train_freq steps
+                if total_steps == self.cgm_train_freq:  # Learn the CGM once at self.cgm_train_freq samples
 
                     # Learn the CGM with the last self.cgm_train_freq samples
                     self.update_cgm()

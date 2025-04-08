@@ -14,7 +14,7 @@ if __name__ == "__main__":
     torch.manual_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    log_wandb = True
+    log_wandb = False
     model_based = True
     env = SimpleCausal_Multi(shifted=False)
     # env = gym.make('HalfCheetah-v4')
