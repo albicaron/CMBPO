@@ -54,7 +54,7 @@ def compute_causal_emp(deep_ensemble,
     # Sample n_action_samples actions
     n_batch = current_states.shape[0]
     n_ens = deep_ensemble.ensemble_size
-    n_sts = deep_ensemble.state_dim
+    n_sts = current_states.shape[1]
 
     actions_sample = [policy.select_action(current_states) for _ in range(n_action_samples)]
     actions_sample = np.stack(actions_sample, axis=0)  # shape: (n_action_samples, n_batch, d_action)
@@ -87,10 +87,10 @@ def compute_causal_emp(deep_ensemble,
 
     # 2) Compute conditional entropy E_{a}[ H(s'| s,a) ]
     entr_per_dim = gaussian_1d_entropy(vars_all_acts)
-    cond_entr = entr_per_dim.sum(dim=-1)  # shape: (n_ens, n_action_samples, n_batch)
+    # cond_entr = entr_per_dim.sum(dim=-1)  # shape: (n_ens, n_action_samples, n_batch)
 
     # Average over actions
-    cond_entr_mean = cond_entr.mean(dim=1)  # shape: (n_ens, n_batch)
+    cond_entr_mean = entr_per_dim.mean(dim=1)  # shape: (n_ens, n_batch)
 
     # 3) Approximate H(s'| s) by a mixture of Gaussians: p(r, s'| s) ~ (1/n_action) sum_i=1..n_action p(r,s'| s,a_i)
     # Compute this for each ensemble member k
@@ -120,7 +120,16 @@ def compute_causal_emp(deep_ensemble,
         mean_exp = means_k.permute(1, 0, 2).unsqueeze(0)  # (1, B, nA, D)
         var_exp = vars_k.permute(1, 0, 2).unsqueeze(0)  # (1, B, nA, D)
 
-        all_log_p_j = gaussian_1d_logpdf(x_exp, mean_exp, var_exp)  # (nM, B, nA)
+        # all_log_p_j = gaussian_1d_logpdf(x_exp, mean_exp, var_exp)  # (nM, B, nA)
+
+        # Compute gaussian_1d_logpdf for each D dimension separately
+        all_log_p_j = torch.zeros(n_mixture_samples, n_batch, n_action_samples, n_sts)  # (nM, B, nA, D)
+        for d in range(n_sts + 1):
+            all_log_p_j[:, :, :] += gaussian_1d_logpdf(x_exp[:, :, :, d], mean_exp[:, :, :, d], var_exp[:, :, :, d])
+
+
+        # TODO: HEREEEE
+
 
         # exponentiate
         p_j = torch.exp(all_log_p_j)  # shape (n_mixture_samples, B, n_action_samples)
@@ -181,7 +190,7 @@ def compute_causal_emp(deep_ensemble,
 
 
 
-def compute_path_ce(local_cgm,
+def compute_path_ce(est_cgm,
                     deep_ensemble,
                     current_states,
                     policy,
@@ -192,9 +201,28 @@ def compute_path_ce(local_cgm,
     local_cgm. Then, it computes the empowerment of the states S^j using the compute_causal_emp function.
     """
 
-    # Get the indexes of the states S^j such that they satisfy the path A -> S^j -> R
-    # in the local_cgm
-    path_indexes = []
+    # Get the indexes of the states S^j such that they satisfy the path A -> S^j -> R from the est_cgm
+    state_dim, action_dim = deep_ensemble.state_dim, deep_ensemble.action_dim
+    sub_cgm_matrix = est_cgm[:(state_dim + action_dim), (state_dim + action_dim):]
+
+    # Sample a 0/1 matrix of the same size as sub_cgm_matrix using entries of the sub_cgm_matrix
+    sub_cgm_matrix = np.random.binomial(1, sub_cgm_matrix)
+
+    r_pa_idx = []
+    for i in range(state_dim):
+        if sub_cgm_matrix[i, -1] == 1:
+            r_pa_idx.append(i)
+    r_pa_idx = np.array(r_pa_idx)
+
+    # Now we have indexes of states s.t. S^j -> R, we can compute the empowerment I(S^j; A | S) for these states only
+    causal_emp = compute_causal_emp(deep_ensemble,
+                                    current_states[:, r_pa_idx],
+                                    policy,
+                                    n_action_samples=n_action_samples,
+                                    n_mixture_samples=n_mixture_samples)
+
+    return causal_emp
+
 
 
 
