@@ -1,22 +1,68 @@
 name: cmbpo
 channels:
+  - conda-forge
   - defaults
 dependencies:
-  - ca-certificates=2025.2.25=hca03da5_0
+  - box2d-py=2.3.8=py38h2b1e499_7
+  - bzip2=1.0.8=h99b78c6_7
+  - ca-certificates=2025.1.31=hf0a4a13_0
+  - cffi=1.16.0=py38h73f40f7_0
+  - ffmpeg=4.3.2=ha8417bf_0
+  - freetype=2.10.4=h17b34a0_1
+  - future=1.0.0=pyhd8ed1ab_0
+  - gettext=0.21.1=h0186832_0
+  - gmp=6.2.1=h9f76cd9_0
+  - gnutls=3.6.13=h706517b_1
+  - gym-box2d=0.21.0=py38h150bfb4_2
+  - imageio=2.36.0=pyh12aca89_1
+  - jbig=2.1=h3422bc3_2003
+  - jpeg=9e=h1a8c8d9_3
+  - lame=3.100=h1a8c8d9_1003
+  - lcms2=2.12=had6a04f_0
+  - lerc=2.2.1=h9f76cd9_0
+  - libblas=3.9.0=31_h10e41b3_openblas
+  - libcblas=3.9.0=31_hb3479ef_openblas
   - libcxx=14.0.6=h848a8c0_0
+  - libdeflate=1.7=h27ca646_5
   - libffi=3.4.4=hca03da5_1
+  - libgfortran=5.0.0=14_2_0_h6c33f7e_1
+  - libgfortran5=14.2.0=h6c33f7e_1
+  - libiconv=1.18=hfe07756_1
+  - liblapack=3.9.0=31_hc9a63f6_openblas
+  - libopenblas=0.3.29=openmp_hf332438_0
+  - libpng=1.6.37=hf7e6567_2
+  - libprotobuf=3.20.3=h514c7bf_0
+  - libtiff=4.3.0=hc6122e1_1
+  - libwebp-base=1.5.0=h2471fea_0
+  - llvm-openmp=20.1.1=hdb05f8b_1
+  - lz4-c=1.9.3=hbdafb3b_1
   - ncurses=6.4=h313beb8_0
-  - openssl=3.0.16=h02f6b3c_0
+  - nettle=3.6=hc6a1b29_0
+  - ninja=1.12.1=hca03da5_0
+  - ninja-base=1.12.1=h48ca7d4_0
+  - olefile=0.47=pyhd8ed1ab_0
+  - openh264=2.1.1=habe5f53_0
+  - openjpeg=2.4.0=h062765e_1
+  - openssl=3.5.0=h81ee809_0
   - pip=24.2=py38hca03da5_0
-  - python=3.8.20=hb885b13_0
+  - pycparser=2.22=pyhd8ed1ab_0
+  - pyglet=1.5.27=py38h10201cd_4
+  - python=3.8.12=hd949e87_1_cpython
+  - python_abi=3.8=2_cp38
+  - pytorch=1.12.1=cpu_py38h7afd69f_0
   - readline=8.2=h1a28f6b_0
   - setuptools=75.1.0=py38hca03da5_0
+  - sleef=3.5.1=h80987f9_2
   - sqlite=3.45.3=h80987f9_0
   - tk=8.6.14=h6ba3021_0
+  - typing_extensions=4.12.2=pyha770c72_0
   - wheel=0.44.0=py38hca03da5_0
+  - x264=1!161.3030=h3422bc3_1
   - xz=5.6.4=h80987f9_1
   - zlib=1.2.13=h18a0788_1
+  - zstd=1.5.0=h861e0a7_0
   - pip:
+      - absl-py==2.2.1
       - appdirs==1.4.4
       - certifi==2025.1.31
       - charset-normalizer==3.4.1
@@ -29,6 +75,7 @@ dependencies:
       - gcastle==1.0.4
       - gitdb==4.0.12
       - gitpython==3.1.44
+      - glfw==2.8.0
       - gym==0.25.2
       - gym-notices==0.0.8
       - idna==3.10
@@ -37,6 +84,7 @@ dependencies:
       - joblib==1.4.2
       - kiwisolver==1.4.7
       - matplotlib==3.7.5
+      - mujoco==2.3.7
       - networkx==3.1
       - numpy==1.24.4
       - packaging==24.2
@@ -44,6 +92,7 @@ dependencies:
       - pillow==10.4.0
       - protobuf==4.25.6
       - psutil==7.0.0
+      - pyopengl==3.1.9
       - pyparsing==3.1.4
       - python-dateutil==2.9.0.post0
       - pytz==2025.2
@@ -56,11 +105,9 @@ dependencies:
       - six==1.17.0
       - smmap==5.0.2
       - threadpoolctl==3.5.0
-      - torch==1.12.1
       - torchaudio==0.12.1
       - torchvision==0.13.1
       - tqdm==4.67.1
-      - typing-extensions==4.12.2
       - tzdata==2025.2
       - urllib3==2.2.3
       - wandb==0.16.6

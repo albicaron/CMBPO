@@ -222,41 +222,53 @@ class StructureLearning:
             cmap_true (str): Colormap for the true DAG.
             cmap_pred (str): Colormap for the predicted DAG.
         """
-        assert predict_dag.shape == true_dag.shape, "predict_dag and true_dag must have the same shape"
-        n = predict_dag.shape[0]
-        vmax = max(np.max(predict_dag), np.max(true_dag), 1)
 
-        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        if true_dag is not None:
 
-        # Plot true DAG
-        im1 = axes[0].imshow(true_dag, cmap=cmap_true, vmin=0, vmax=vmax)
-        axes[0].set_title("True DAG")
-        axes[0].set_xticks(range(n))
-        axes[0].set_yticks(range(n))
-        if labels:
-            axes[0].set_xticklabels(labels, rotation=90)
-            axes[0].set_yticklabels(labels)
-        fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+            assert predict_dag.shape == true_dag.shape, "predict_dag and true_dag must have the same shape"
+            n = predict_dag.shape[0]
+            vmax = max(np.max(predict_dag), np.max(true_dag), 1)
 
-        # Plot predicted DAG
-        im2 = axes[1].imshow(predict_dag, cmap=cmap_pred, vmin=0, vmax=vmax)
-        axes[1].set_title("Predicted DAG")
-        axes[1].set_xticks(range(n))
-        axes[1].set_yticks(range(n))
-        if labels:
-            axes[1].set_xticklabels(labels, rotation=90)
-            axes[1].set_yticklabels(labels)
-        fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+            fig, axes = plt.subplots(1, 2, figsize=figsize)
 
-        plt.tight_layout()
+            # Plot true DAG
+            im1 = axes[0].imshow(true_dag, cmap=cmap_true, vmin=0, vmax=vmax)
+            axes[0].set_title("True DAG")
+            axes[0].set_xticks(range(n))
+            axes[0].set_yticks(range(n))
+            if labels:
+                axes[0].set_xticklabels(labels, rotation=90)
+                axes[0].set_yticklabels(labels)
+            fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
 
-        # if save_name:
-        #     plt.savefig(save_name, dpi=300, bbox_inches='tight')
-        #     print(f"Plot saved to {save_name}")
-        # else:
-        #     plt.show()
+            # Plot predicted DAG
+            im2 = axes[1].imshow(predict_dag, cmap=cmap_pred, vmin=0, vmax=vmax)
+            axes[1].set_title("Predicted DAG")
+            axes[1].set_xticks(range(n))
+            axes[1].set_yticks(range(n))
+            if labels:
+                axes[1].set_xticklabels(labels, rotation=90)
+                axes[1].set_yticklabels(labels)
+            fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
 
-        # Return the figure
+            plt.tight_layout()
+
+        else:
+
+            # If no true DAG plot only the predicted DAG
+            n = predict_dag.shape[0]
+            vmax = max(np.max(predict_dag), np.max(predict_dag), 1)
+
+            fig, ax = plt.subplots(figsize=figsize)
+            im = ax.imshow(predict_dag, cmap=cmap_pred, vmin=0, vmax=vmax)
+            ax.set_title("Predicted DAG")
+            ax.set_xticks(range(n))
+            ax.set_yticks(range(n))
+            if labels:
+                ax.set_xticklabels(labels, rotation=90)
+                ax.set_yticklabels(labels)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
         return fig
 
     def calculate_metrics(self, predict_dag, true_dag):

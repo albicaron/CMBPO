@@ -1,8 +1,9 @@
 import torch
+import numpy as np
 
 # from envs.causal_env import SimpleCausalEnv
-from envs.causal_env_multiaction import SimpleCausal_Multi
-from algs.cmbpo_sac import CMBPO_SAC
+# from algs.cmbpo_sac import set_device, CMBPO_SAC
+from algs.cmbpo_sac_ensemble import set_device, CMBPO_SAC
 
 import gym
 
@@ -12,15 +13,17 @@ if __name__ == "__main__":
     # Initialize environment
     seed = 0
     torch.manual_seed(seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    np.random.seed(seed)
 
-    log_wandb = False
+    device = set_device()
+
+    log_wandb = True
     model_based = True
-    env = SimpleCausal_Multi(shifted=False)
-    # env = gym.make('HalfCheetah-v4')
+    # env = SimpleCausal_Multi(shifted=False)
+    env = gym.make('HalfCheetah-v4')
 
     agent = CMBPO_SAC(env, seed, device, log_wandb=log_wandb, model_based=model_based, pure_imaginary=False)
-    agent.train(num_episodes=100, max_steps=200)
+    agent.train(num_episodes=200, max_steps=1_000)
 
     # Save the model
     agent.save_agent(base_dir='trained_agents/')

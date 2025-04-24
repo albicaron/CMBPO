@@ -43,29 +43,72 @@ class ReplayBuffer:
 
         return batch
 
+    def push_batch(self, states, actions, rewards, next_states, dones):
+        """
+        Insert a batch of transitions into the replay buffer. It takes a numpy array or list of transitions for
+        each component.
+        :param states:
+        :param actions:
+        :param rewards:
+        :param next_states:
+        :param dones:
+        :return:
+        """
+        batch_size = len(states)
+        # If the buffer is not full, extend it
+        for i in range(batch_size):
+            if len(self.buffer) < self.capacity:
+                self.buffer.append(None)
+            self.buffer[self.position] = (states[i],
+                                          actions[i],
+                                          rewards[i].item(),
+                                          next_states[i],
+                                          dones[i].item())
+            self.position = (self.position + 1) % self.capacity
+
+    def clear(self):
+        self.buffer = []
+        self.position = 0
+
     def __len__(self):
         return len(self.buffer)
 
 
 # Actor Network
 class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action):
+    def __init__(self, state_dim, action_dim, max_action, hidden_dim=256):
         super(Actor, self).__init__()
 
         self.net = nn.Sequential(
-            layer_init(nn.Linear(state_dim, 256)),
+            layer_init(nn.Linear(state_dim, hidden_dim)),
             nn.ReLU(),
-            layer_init(nn.Linear(256, 256)),
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
             nn.ReLU(),
-            layer_init(nn.Linear(256, action_dim), std=0.01)
+            layer_init(nn.Linear(hidden_dim, 2 * action_dim), std=0.01)
         )
 
+        self.log_std_min = -5.0
+        self.log_std_max = 2.0
         self.max_action = max_action
 
     def forward(self, state):
-        mean = self.net(state)
-        log_std = torch.full_like(mean, -0.5)
-        std = log_std.exp()
+
+        out = self.net(state)
+
+        # Split mean and log_std
+        mean, log_std = out.chunk(2, dim=-1)
+
+        # Clamp log_std to be within the specified range
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+
+        # Replace any NaN / ±Inf that survived clamp (can happen if `out` had NaN)
+        bad_mask = torch.isnan(log_std) | torch.isinf(log_std)
+        if bad_mask.any():
+            log_std[bad_mask] = self.log_std_min
+
+        # Convert log_std to std
+        std = log_std.exp().clamp_min(1e-6)
+
         return mean, std
 
     def sample(self, state):
@@ -91,7 +134,7 @@ class Actor(nn.Module):
 
 # Critic Network
 class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=64):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(Critic, self).__init__()
 
         # Q1 architecture
@@ -149,7 +192,7 @@ class SAC:
         if state.ndim == 1:
             state = state.reshape(1, -1)
 
-        state = torch.FloatTensor(state).to(self.device)
+        state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
         action, _ = self.actor.sample(state)
         return action.cpu().data.numpy()
 

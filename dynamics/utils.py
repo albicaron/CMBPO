@@ -1,5 +1,38 @@
 import torch
 import numpy as np
+import math
+
+class RunningNormalizer:
+    def __init__(self, size, device, eps=1e-8):
+        self.mean = torch.zeros(size, device=device)
+        self.var = torch.ones(size, device=device)
+        self.count = torch.tensor(eps, device=device)
+
+    def update(self, x: torch.Tensor):
+        batch_mean = x.mean(dim=0)
+        batch_var = x.var(dim=0, unbiased=False)
+        batch_count = x.size(0)
+
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta.pow(2) * self.count * batch_count / total_count
+        new_var = M2 / total_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = total_count
+
+    def normalize(self, x):
+        return (x - self.mean) / (self.var.sqrt() + 1e-8)
+
+    def denormalize(self, x):
+        return x * (self.var.sqrt() + 1e-8) + self.mean
+
+
 
 
 def compute_jsd(means, var_s):
@@ -7,13 +40,14 @@ def compute_jsd(means, var_s):
     # Data are in (ens_size, n_actors, d_state). Need to transpose to (n_actors, ens_size, d_state)
     state_delta_means = means.transpose(0, 1)
     next_state_vars = var_s.transpose(0, 1)
+    next_state_vars = rescale_var(next_state_vars)  # shape: (n_actors, ensemble_size, d_state)
 
     mu, var = state_delta_means, next_state_vars                         # shape: both (n_actors, ensemble_size, d_state)
     n_act, es, d_s = mu.size()                                            # shape: (n_actors, ensemble_size, d_state)
 
     # entropy of the mean
-    mu_diff = mu.unsqueeze(1) - mu.unsqueeze(2)                           # shape: (n_actors, ensemble_size, ensemble_size, d_state)
-    var_sum = var.unsqueeze(1) + var.unsqueeze(2)                         # shape: (n_actors, ensemble_size, ensemble_size, d_state)
+    mu_diff = mu.unsqueeze(2) - mu.unsqueeze(1)                          # shape: (n_actors, ensemble_size, ensemble_size, d_state)
+    var_sum = var.unsqueeze(2) + var.unsqueeze(1)                        # shape: (n_actors, ensemble_size, ensemble_size, d_state)
 
     err = (mu_diff * 1 / var_sum * mu_diff)                               # shape: (n_actors, ensemble_size, ensemble_size, d_state)
     err = torch.sum(err, dim=-1)                                          # shape: (n_actors, ensemble_size, ensemble_size)
@@ -37,11 +71,123 @@ def compute_jsd(means, var_s):
     return jsd
 
 
+import math
+import torch
+
+
+def compute_causal_emp_fast(
+    deep_ensemble,
+    current_states,                   # Tensor (B, D_s)
+    policy,                           # π(a|s)
+    n_action_samples: int = 100,
+    n_mixture_samples: int = 1_000,
+    reward_idx: int = -1,             # index of reward in the model output
+    chunk_size: int = 4,              # ↓ memory footprint of the mixture loop
+):
+    """
+    Memory– and speed-optimised per-state-dimension empowerment
+    I(S'_j; A | S=s) for every ensemble member k, batch element b and
+    state dimension j (reward dim excluded).
+
+    Returns
+    -------
+    Tensor (K, B, D_s)   where K = ensemble size, B = batch, D_s = state dims
+    """
+    device   = deep_ensemble.device
+    B, D_s   = current_states.shape
+    K        = deep_ensemble.ensemble_size
+    TWO_PI_E = 2.0 * math.pi * math.e
+
+    # ------------------------------------------------------------------
+    # 1. Sample actions  a_i ~ π(a|s)            → Tensor (A, B, D_a)
+    # ------------------------------------------------------------------
+    actions_np = np.stack(
+        [policy.select_action(current_states) for _ in range(n_action_samples)],
+        axis=0,
+    )
+    actions_sample = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
+
+    # ------------------------------------------------------------------
+    # 2. Single forward pass through the ensemble  → mu_, sigma2  (K, A, B, D_s+1)
+    # ------------------------------------------------------------------
+    s_rep  = current_states.to(device).unsqueeze(0).expand(n_action_samples, -1, -1)
+    inputs = torch.cat(
+        [s_rep.reshape(-1, D_s), actions_sample.reshape(-1, policy.action_dim)],
+        dim=1,
+    )                                        # (A·B, D_s + D_a)
+    inputs = deep_ensemble.input_normalizer.normalize(inputs)
+
+    with torch.no_grad():
+        mean_preds, logvar_preds = deep_ensemble(inputs)  # lists length K
+
+    mean = torch.stack([m.view(n_action_samples, B, -1) for m in mean_preds], dim=0)
+    var  = torch.exp(
+        torch.stack([v.view(n_action_samples, B, -1) for v in logvar_preds], dim=0)
+    )
+
+    # Drop reward dimension
+    mean = mean[..., :reward_idx]             # (K, A, B, D_s)
+    var  = var [...,  :reward_idx]
+    D_s_eff = mean.size(-1)
+
+    # ------------------------------------------------------------------
+    # 3. Conditional entropy  H(S'|S,A)              (K, B, D_s)
+    # ------------------------------------------------------------------
+    cond_H = 0.5 * torch.log(TWO_PI_E * var).mean(dim=1)
+
+    # ------------------------------------------------------------------
+    # 4. Marginal entropy  H(S'|S)  via MC mixture   (K, B, D_s)
+    #     Process actions in CHUNKS to keep memory low.
+    # ------------------------------------------------------------------
+    # 4.1 Draw mixture-component indices   i ∈ {0,…,A-1}
+    idx = torch.randint(
+        0, n_action_samples,
+        (n_mixture_samples, B),
+        device=device,
+        dtype=torch.long,
+    )                                         # (M, B)
+
+    idx_exp = (
+        idx.unsqueeze(0)                      # (1, M, B)
+           .unsqueeze(-1)                     # (1, M, B, 1)
+           .expand(K, -1, -1, D_s_eff)        # (K, M, B, D)
+    )
+
+    mean_choice = mean.gather(1, idx_exp)     # (K, M, B, D)
+    var_choice  = var .gather(1, idx_exp)
+    x_samples   = torch.normal(mean_choice, torch.sqrt(var_choice))
+
+    # 4.2 Accumulate log-sum-exp over actions in chunks
+    log_sumexp = None                         # will hold (K, M, B, D)
+
+    for start in range(0, n_action_samples, chunk_size):
+        end   = min(start + chunk_size, n_action_samples)
+        mu_     = mean[:, start:end, :, :].unsqueeze(1)      # (K,1,chunk,B,D)
+        sigma2    = var[:,  start:end, :, :].unsqueeze(1)      # (K,1,chunk,B,D)
+
+        diff  = x_samples.unsqueeze(2) - mu_                 # (K,M,chunk,B,D)
+        log_p = -0.5 * (torch.log(2.0 * math.pi * sigma2) +
+                        diff.pow(2) / sigma2)                  # (K,M,chunk,B,D)
+
+        log_p_chunk = torch.logsumexp(log_p, dim=2)        # (K,M,B,D)
+
+        log_sumexp = log_p_chunk if log_sumexp is None     \
+                     else torch.logaddexp(log_sumexp, log_p_chunk)
+
+    log_p_mix = log_sumexp - math.log(n_action_samples)    # uniform weights
+    marg_H    = -log_p_mix.mean(dim=1)                     # average over M
+
+    # ------------------------------------------------------------------
+    # 5. Empowerment   I = H - H_cond
+    # ------------------------------------------------------------------
+    return marg_H - cond_H
+
+
 def compute_causal_emp(deep_ensemble,
                        current_states,
                        policy,
-                       n_action_samples=50,
-                       n_mixture_samples=100):
+                       n_action_samples=100,
+                       n_mixture_samples=1_000):
     """
     For each ensemble member k, compute:
        E_k = H(s'| s) - E_{a}[ H(s'| s,a) ],
@@ -58,7 +204,7 @@ def compute_causal_emp(deep_ensemble,
 
     actions_sample = [policy.select_action(current_states) for _ in range(n_action_samples)]
     actions_sample = np.stack(actions_sample, axis=0)  # shape: (n_action_samples, n_batch, d_action)
-    actions_sample = torch.tensor(actions_sample, dtype=torch.float32)
+    actions_sample = torch.tensor(actions_sample, dtype=torch.float32, device=deep_ensemble.device)
 
     current_states = current_states.clone().detach() if torch.is_tensor(current_states) else torch.tensor(current_states)
 
@@ -69,14 +215,22 @@ def compute_causal_emp(deep_ensemble,
         action_i = actions_sample[k]
         model_input = torch.cat([current_states, action_i], dim=1)
 
+        # # Version with Factorized Ensemble
+        # model_input = deep_ensemble.input_normalizer.normalize(model_input)
+        # with torch.no_grad():
+        #     mean_preds, logvar_preds = deep_ensemble(model_input)
+        # all_preds_mean = torch.stack([torch.stack(group, dim=0).squeeze(-1) for group in mean_preds], dim=0)  # shape: (n_ens, n_batch, d_state)
+        # all_preds_var = torch.stack([torch.stack(group, dim=0).squeeze(-1) for group in logvar_preds], dim=0)  # shape: (n_ens, n_batch, d_state)
+        #
+        # # Swap axes to [n_ens, n_batch, n_dim]
+        # all_preds_mean = all_preds_mean.permute(1, 2, 0)  # shape: (n_batch, d_state, n_ens)
+        # all_preds_var = all_preds_var.permute(1, 2, 0)  # shape: (n_batch, d_state, n_ens)
+
+        # Version with Ensemble
+        model_input = deep_ensemble.input_normalizer.normalize(model_input)
         with torch.no_grad():
             mean_preds, logvar_preds = deep_ensemble(model_input)
-        all_preds_mean = torch.stack([torch.stack(group, dim=0).squeeze(-1) for group in mean_preds], dim=0)
-        all_preds_var = torch.stack([torch.stack(group, dim=0).squeeze(-1) for group in logvar_preds], dim=0)
-
-        # Swap axes to [n_ens, n_batch, n_dim]
-        all_preds_mean = all_preds_mean.permute(1, 2, 0)  # shape: (n_batch, d_state, n_ens)
-        all_preds_var = all_preds_var.permute(1, 2, 0)  # shape: (n_batch, d_state, n_ens)
+        all_preds_mean, all_preds_var = torch.stack(mean_preds, dim=0), torch.stack(logvar_preds, dim=0)  # shape: (n_ens, n_batch, d_state)
 
         means_all_acts.append(all_preds_mean)
         logvars_all_acts.append(all_preds_var)
@@ -85,17 +239,21 @@ def compute_causal_emp(deep_ensemble,
     logvars_all_acts = torch.stack(logvars_all_acts, dim=1)  # shape: (n_ens, n_action_samples, n_batch, d_state)
     vars_all_acts = torch.exp(logvars_all_acts)
 
+    # Remove the last reward dimension (d_state) from means_all_acts and vars_all_acts
+    means_all_acts = means_all_acts[:, :, :, :-1]  # shape: (n_ens, n_action_samples, n_batch, d_state)
+    vars_all_acts = vars_all_acts[:, :, :, :-1]  # shape: (n_ens, n_action_samples, n_batch, d_state)
+
     # 2) Compute conditional entropy E_{a}[ H(s'| s,a) ]
     entr_per_dim = gaussian_1d_entropy(vars_all_acts)
     # cond_entr = entr_per_dim.sum(dim=-1)  # shape: (n_ens, n_action_samples, n_batch)
 
     # Average over actions
-    cond_entr_mean = entr_per_dim.mean(dim=1)  # shape: (n_ens, n_batch)
+    cond_entr_mean = entr_per_dim.mean(dim=1)  # shape: (n_ens, n_batch, d_state)
 
     # 3) Approximate H(s'| s) by a mixture of Gaussians: p(r, s'| s) ~ (1/n_action) sum_i=1..n_action p(r,s'| s,a_i)
     # Compute this for each ensemble member k
-    # We'll store an estimate for H_mix per (n_ens, n_batch)
-    marg_entr = torch.zeros(n_ens, n_batch)
+    # We'll store an estimate for H_mix per (n_ens, n_batch, n_sts)
+    marg_entr = torch.zeros(n_ens, n_batch, n_sts, device=deep_ensemble.device)
 
     for k in range(n_ens):
 
@@ -107,11 +265,11 @@ def compute_causal_emp(deep_ensemble,
         # TODO: This is the computational bottleneck
         # We're vectorizing the computation across the batch dimension
         # 1) Draw mixture indices i ~ Uniform(0, n_action_samples)
-        i_choice = torch.randint(low=0, high=n_action_samples, size=(n_mixture_samples, n_batch))  # shape (n_mixture_samples, B)
+        i_choice = torch.randint(low=0, high=n_action_samples, size=(n_mixture_samples, n_batch), device=deep_ensemble.device)  # shape (n_mixture_samples, B)
 
         # 2) Sample x from the chosen Gaussian  # shape (n_mixture_samples, B, D)
-        m_ = torch.gather(means_k, dim=0, index=i_choice.unsqueeze(-1).expand(n_mixture_samples, n_batch, n_sts + 1))
-        v_ = torch.gather(vars_k, dim=0, index=i_choice.unsqueeze(-1).expand(n_mixture_samples, n_batch, n_sts + 1))
+        m_ = torch.gather(means_k, dim=0, index=i_choice.unsqueeze(-1).expand(n_mixture_samples, n_batch, n_sts))
+        v_ = torch.gather(vars_k, dim=0, index=i_choice.unsqueeze(-1).expand(n_mixture_samples, n_batch, n_sts))
         sample_x = torch.normal(mean=m_, std=torch.sqrt(v_))  # shape (n_mixture_samples, B, D)
 
         # 3) Compute p_mix(sample_x) = 1/n_actions * sum_j Normal_j(sample_x) (n_action_samples, n_mixture_samples, B)
@@ -124,102 +282,86 @@ def compute_causal_emp(deep_ensemble,
 
         # Compute gaussian_1d_logpdf for each D dimension separately
         all_log_p_j = torch.zeros(n_mixture_samples, n_batch, n_action_samples, n_sts)  # (nM, B, nA, D)
-        for d in range(n_sts + 1):
-            all_log_p_j[:, :, :] += gaussian_1d_logpdf(x_exp[:, :, :, d], mean_exp[:, :, :, d], var_exp[:, :, :, d])
-
-
-        # TODO: HEREEEE
-
+        for d in range(n_sts):
+            all_log_p_j[:, :, :, d] = gaussian_1d_logpdf(x_exp[:, :, :, d].unsqueeze(-1),
+                                                         mean_exp[:, :, :, d].unsqueeze(-1),
+                                                         var_exp[:, :, :, d].unsqueeze(-1))  # (nM, B, nA, 1)
 
         # exponentiate
-        p_j = torch.exp(all_log_p_j)  # shape (n_mixture_samples, B, n_action_samples)
-        p_mix_x = (1.0 / n_action_samples) * p_j.sum(dim=-1)  # shape (n_mixture_samples, B)
+        p_j = torch.exp(all_log_p_j)  # shape (n_mixture_samples, B, n_action_samples, D)
+        p_mix_x = (1.0 / n_action_samples) * p_j.sum(dim=2)  # shape (n_mixture_samples, B, D)
 
         # Average over mixture samples
         log_p_mix_x = torch.log(p_mix_x + 1e-45)  # add tiny for numerical safety
-        avg_log_p_mix = log_p_mix_x.mean(dim=0)  # shape (B,)
+        avg_log_p_mix = log_p_mix_x.mean(dim=0)  # shape (B, D)
 
         # negative is the differential entropy
-        marg_entr[k, :] = -avg_log_p_mix
-
-        # for b in range(n_batch):
-        #     # We do n_mixture_samples Monte Carlo draws from the mixture
-        #     log_p_mix_accum = 0.0
-        #     for _ in range(n_mixture_samples):
-        #         # 1) pick a mixture index i ~ Uniform
-        #         i_choice = np.random.randint(0, n_action_samples)
-        #
-        #         # 2) sample x from that chosen Gaussian
-        #         m_ = means_k[i_choice, b, :]  # shape (D,)
-        #         v_ = vars_k[i_choice, b, :]
-        #         # sample_x => shape (D,)
-        #         sample_x = torch.normal(mean=m_, std=torch.sqrt(v_))
-        #
-        #         # 3) compute p_mix(sample_x) = 1/n_actions * sum_j Normal_j(sample_x)
-        #         #    We'll do it dimension-by-dimension (diagonal):
-        #         #      Normal_j(sample_x) = exp( gaussian_1d_logpdf(sample_x, means_k[j,b,:], vars_k[j,b,:]) )
-        #         # We'll accumulate them in a loop or vectorized.
-        #         # shape (n_action_samples,)
-        #         # all_log_p_j => log of each Normal_j(sample_x)
-        #         # p_j => we need to exponentiate
-        #         # then sum up, multiply by 1/n_action_samples
-        #         # then log again.
-        #
-        #         # Let's do it in a vectorized form:
-        #         all_log_p_j = gaussian_1d_logpdf(
-        #             sample_x.unsqueeze(0),  # shape (1, D)
-        #             means_k[:, b, :],  # shape (n_action_samples, D)
-        #             vars_k[:, b, :]  # shape (n_action_samples, D)
-        #         )  # => shape (n_action_samples,)
-        #         # exponentiate
-        #         p_j = torch.exp(all_log_p_j)  # shape (n_action_samples,)
-        #         p_mix_x = (1.0 / n_action_samples) * p_j.sum(dim=0)  # scalar
-        #         log_p_mix_x = torch.log(p_mix_x + 1e-45)  # add tiny for numerical safety
-        #
-        #         log_p_mix_accum += log_p_mix_x.item()
-        #
-        #     # Average log p_mixture
-        #     avg_log_p_mix = log_p_mix_accum / n_mixture_samples
-        #     # negative is the differential entropy
-        #     marg_entr[k, b] = -avg_log_p_mix
+        marg_entr[k, :, :] = -avg_log_p_mix  # shape (B, D)
 
     # 4) Compute E_k = H(s'| s) - E_{a}[ H(s'| s,a) ]
     causal_empow = marg_entr - cond_entr_mean
 
-    return causal_empow
-
+    return causal_empow  # shape: (n_ens, n_batch, d_state)
 
 
 def compute_path_ce(est_cgm,
                     deep_ensemble,
                     current_states,
                     policy,
-                    n_action_samples=50,
-                    n_mixture_samples=100):
+                    n_action_samples=128,
+                    n_mixture_samples=1_000):
     """
     This function first gathers the indexes of the states S^j such that they satisfy the path A -> S^j -> R, in the
     local_cgm. Then, it computes the empowerment of the states S^j using the compute_causal_emp function.
     """
 
+    if not torch.is_tensor(est_cgm):
+        est_cgm = torch.tensor(est_cgm, dtype=torch.float32, device=deep_ensemble.device)
+    else:
+        est_cgm = est_cgm.to(deep_ensemble.device)
+
     # Get the indexes of the states S^j such that they satisfy the path A -> S^j -> R from the est_cgm
-    state_dim, action_dim = deep_ensemble.state_dim, deep_ensemble.action_dim
-    sub_cgm_matrix = est_cgm[:(state_dim + action_dim), (state_dim + action_dim):]
+    state_dim, action_dim = deep_ensemble.state_dim, policy.action_dim
 
-    # Sample a 0/1 matrix of the same size as sub_cgm_matrix using entries of the sub_cgm_matrix
-    sub_cgm_matrix = np.random.binomial(1, sub_cgm_matrix)
+    # edges FROM (actions+states)  TO  (next-states+reward)
+    sub_cgm_matrix = est_cgm[:(state_dim + action_dim),
+                             (state_dim + action_dim):].detach()
 
-    r_pa_idx = []
-    for i in range(state_dim):
-        if sub_cgm_matrix[i, -1] == 1:
-            r_pa_idx.append(i)
-    r_pa_idx = np.array(r_pa_idx)
+    # ── deterministic parent mask ────────────────────────────────────────
+    sub_cgm_matrix = (sub_cgm_matrix > 0.5).float()  # threshold at 0.5
+
+    # states that satisfy  A → Sʲ  **and**  Sʲ → R
+    has_a_to_s = sub_cgm_matrix[:action_dim, :state_dim].any(dim=0)      # (D_s,)
+    has_s_to_r = sub_cgm_matrix[action_dim:, -1] == 1  # (D_s,)
+
+    r_pa_idx = torch.nonzero(has_a_to_s & has_s_to_r, as_tuple=False).squeeze(-1)  # 1-D tensor
+
+    # sub_cgm_matrix = est_cgm[:(state_dim + action_dim), (state_dim + action_dim):]
+    # sub_cgm_matrix = torch.tensor(sub_cgm_matrix, dtype=torch.float32, device=deep_ensemble.device).clone().detach()
+    #
+    # # Sample a 0/1 matrix of the same size as sub_cgm_matrix using entries of the sub_cgm_matrix
+    # sub_cgm_matrix = np.random.binomial(1, sub_cgm_matrix.clone().detach().cpu().numpy())
+    #
+    # r_pa_idx = []
+    # for i in range(state_dim):
+    #     if sub_cgm_matrix[i, -1] == 1:
+    #         r_pa_idx.append(i)
+    # r_pa_idx = np.array(r_pa_idx)
 
     # Now we have indexes of states s.t. S^j -> R, we can compute the empowerment I(S^j; A | S) for these states only
-    causal_emp = compute_causal_emp(deep_ensemble,
-                                    current_states[:, r_pa_idx],
-                                    policy,
-                                    n_action_samples=n_action_samples,
-                                    n_mixture_samples=n_mixture_samples)
+    # causal_emp = compute_causal_emp(deep_ensemble,
+    #                                 current_states,
+    #                                 policy,
+    #                                 n_action_samples=n_action_samples,
+    #                                 n_mixture_samples=n_mixture_samples)
+    causal_emp = compute_causal_emp_fast(deep_ensemble,
+                                         current_states,
+                                         policy,
+                                         n_action_samples=n_action_samples,
+                                         n_mixture_samples=n_mixture_samples)
+
+    # Now we have the empowerment for all states, we need to keep only the ones that satisfy the path A -> S^j -> R
+    causal_emp = causal_emp[:, :, r_pa_idx]  # shape: (n_ens, n_batch, n_states)
 
     return causal_emp
 
@@ -259,3 +401,10 @@ def gaussian_1d_logpdf(x, mean, var):
     quad = 0.5 * torch.sum((x - mean) ** 2 / var, dim=-1)  # shape: (nM, B, nA)
 
     return -(log_det + quad)
+
+
+def rescale_var(var, min_log_var=-5., max_log_var=1., decay=0.1):
+    min_log_var = torch.tensor(min_log_var, dtype=torch.float32)
+    max_log_var = torch.tensor(max_log_var, dtype=torch.float32)
+    min_var, max_var = torch.exp(min_log_var), torch.exp(max_log_var)
+    return max_var - decay * (max_var - var)

@@ -6,6 +6,7 @@ from algs.sac import SAC, ReplayBuffer
 from dynamics.causal_models import StructureLearning, set_p_matrix
 from dynamics.utils import compute_jsd, compute_causal_emp, compute_path_ce
 from dynamics.causal_dynamics_models import FactorizedEnsembleModel
+from dynamics.dynamics_models import EnsembleModel
 import matplotlib.pyplot as plt
 
 import wandb
@@ -15,16 +16,29 @@ import random
 torch.set_default_dtype(torch.float32)
 
 
+# Check if MPS is available and set the device to 'mps' if on MacOS, 'cuda' if on GPU, or 'cpu' otherwise
+def set_device():
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    return device
+
+
 class CMBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True,
-                 sl_method="PC", bootstrap='standard', n_bootstrap=100, cgm_train_freq=3_000,
+                 sl_method="PC", bootstrap=None, n_bootstrap=100, cgm_train_freq=6_000,
                  causal_bonus=True, causal_eta=0.1, var_causal_bonus=False, var_causal_eta=0.01,
                  jsd_bonus=False, jsd_eta=0.1, jsd_thres=1.0,
                  lr_model=1e-3,
-                 lr_sac=0.0003, agent_steps=1, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=15,
-                 num_model_rollouts=400,  # Maybe put 100_000 as it is batched anyway
-                 update_size=250, sac_train_freq=1, model_train_freq=100, batch_size=250):
+                 lr_sac=0.0003, agent_steps=10, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=1,
+                 rollout_per_step=400,  # Maybe put 100_000 as it is batched anyway
+                 update_size=256, sac_train_freq=1, model_train_freq=250, batch_size=256):
 
+        steps_per_epoch = 1_000
         self.env = env
         self.seed = seed
         self.log_wandb = log_wandb
@@ -40,11 +54,12 @@ class CMBPO_SAC:
         self.tau = tau
         self.alpha = alpha
         self.max_rollout_len = max_rollout_len
-        self.num_model_rollouts = num_model_rollouts
+        self.num_model_rollouts = rollout_per_step
 
         self.update_size = update_size  # Size of the final buffer to train the SAC agent made of %5-95% real-imaginary
 
-        self.agent_steps = agent_steps
+        # The agent steps are 1 for SAC and agent_steps for MBPO
+        self.agent_steps = agent_steps if self.model_based else 1
         self.sac_train_freq = sac_train_freq
         self.model_train_freq = model_train_freq
 
@@ -55,11 +70,13 @@ class CMBPO_SAC:
         self.sac_agent = SAC(self.state_dim, self.action_dim, self.max_action, lr=lr_sac, gamma=gamma,
                              tau=tau, alpha=alpha, device=self.device)
 
+        # self.ensemble_model = EnsembleModel(state_dim=self.state_dim, action_dim=self.action_dim, lr=lr_model,
+        #                                     device=self.device, ensemble_size=7).to(self.device)
         self.ensemble_model = FactorizedEnsembleModel(state_dim=self.state_dim, action_dim=self.action_dim, lr=lr_model,
-                                                      ensemble_size=10).to(self.device)
+                                                      ensemble_size=10, device=self.device)
 
-        self.real_buffer = ReplayBuffer(int(10_000))
-        self.imaginary_buffer = ReplayBuffer(int(10_000))
+        self.real_buffer = ReplayBuffer(int(1_000_000))
+        self.imaginary_buffer = ReplayBuffer(int(rollout_per_step * steps_per_epoch))  # 1_000 * 400 = 400_000
 
         self.jsd_thres, self.jsd_bonus, self.jsd_eta = jsd_thres, jsd_bonus, jsd_eta
 
@@ -72,16 +89,13 @@ class CMBPO_SAC:
                                            sl_method=sl_method, bootstrap=bootstrap)
         self.p_matrix = set_p_matrix(self.state_dim, self.action_dim)
 
-        # # In SimpleCausalEnv, allow to learn same time state depencencies
-        # if self.env.unwrapped.spec is None:
-        #     self.p_matrix[:self.state_dim, :self.state_dim] = -1
-        #     # self.p_matrix[self.state_dim + self.action_dim:, self.state_dim + self.action_dim:] = -1  # Also for S'?
-
         self.pk = self.local_cgm.set_prior_knowledge(p_matrix=self.p_matrix)
 
         # Initialize the estimated CGM as a fully connected graph
         self.est_cgm = np.ones((self.state_dim + self.action_dim + self.state_dim + 1,
                                 self.state_dim + self.action_dim + self.state_dim + 1))
+        self.est_cgm = torch.FloatTensor(self.est_cgm).to(self.device)
+
         self.true_cgm = self.env.get_adj_matrix() if hasattr(self.env, 'get_adj_matrix') else None
 
         self.causal_bonus, self.causal_eta = causal_bonus, causal_eta
@@ -89,6 +103,7 @@ class CMBPO_SAC:
 
     def update_model(self, batch_size=256, epochs=100):  # We increase epochs to 100 as we have state_dim+1 models
 
+        # If Factored model then this
         model_loss = self.ensemble_model.train_factorized_ensemble(self.real_buffer, batch_size, epochs)
 
         return model_loss
@@ -105,10 +120,12 @@ class CMBPO_SAC:
           we stop rolling out that particular state.
         """
 
-        if len(self.real_buffer) < 2_000:
-            max_length_traj = 1
-        else:
-            max_length_traj = self.max_rollout_len
+        # Augment max_length_traj by 1 every 10_000 steps
+        add_on = 0
+        if len(self.real_buffer) > 200_000:
+            add_on = int(len(self.real_buffer) / 200_000)
+
+        max_length_traj = self.max_rollout_len + add_on
 
         # Number of rollouts to generate from the real buffer
         num_samples = min(self.num_model_rollouts, len(self.real_buffer))
@@ -124,9 +141,7 @@ class CMBPO_SAC:
 
         # Let us define a hyperparameter or heuristic threshold for "too high" variance
         # In practice, you can tune this threshold or make it adapt over time.
-        jsd_threshold = 0.5  # or any other measure you want
-
-        current_states = initial_states.clone().numpy()
+        jsd_threshold = 1.0  # or any other measure you want
 
         # Sample an ensemble index for each sample in the batch, to use consistent ensemble members for each rollout
         ensemble_idx = torch.randint(self.ensemble_model.ensemble_size, (num_samples,))
@@ -137,12 +152,14 @@ class CMBPO_SAC:
             if not active_mask.any():
                 break
 
-            actions = self.sac_agent.select_action(current_states)
+            actions = self.sac_agent.select_action(initial_states)
             actions = torch.FloatTensor(actions).to(self.device)
 
             model_input = torch.cat([initial_states, actions], dim=1)
 
             # Ensemble predictions: shape [ensemble_size, batch_size, next_state_dim+1]
+            # Normalize the inputs
+            model_input = self.ensemble_model.input_normalizer.normalize(model_input)
             with torch.no_grad():
                 mean_preds, logvar_preds = self.ensemble_model(model_input)
             all_preds_mean = torch.stack([torch.stack(group, dim=0).squeeze(-1) for group in mean_preds], dim=0)
@@ -156,17 +173,22 @@ class CMBPO_SAC:
             # TODO:  NB, Here we pick a single ensemble member for each batch sample to keep consistent graphs
             # ensemble_idx = torch.randint(self.ensemble_model.ensemble_size, (1,)).item()
             # mean_pred, log_var_pred = all_preds_mean[ensemble_idx], all_preds_var[ensemble_idx]
-
             batch_idx = torch.arange(num_samples, device=self.device)
             mean_pred = all_preds_mean[ensemble_idx, batch_idx]
 
-            next_states = mean_pred[:, :-1]
-            rewards = mean_pred[:, -1].unsqueeze(1)
+            # Denormalize the outputs
+            denorm_mean_pred = self.ensemble_model.output_normalizer.denormalize(mean_pred)
+
+            next_states = denorm_mean_pred[:, :-1]
+            next_states = initial_states + next_states  # Add the delta state to the initial state
+
+            rewards = denorm_mean_pred[:, -1].unsqueeze(1)
             dones = torch.zeros_like(rewards)
 
             # Compute uncertainty as disagreement across ensemble (JSD) - can use it also as intrinsic reward
             ns_jsd = compute_jsd(all_preds_mean, torch.exp(all_preds_var))
 
+            # REWARDS AUGMENTATION
             if self.jsd_bonus:
                 rewards += self.jsd_eta * ns_jsd
 
@@ -174,32 +196,42 @@ class CMBPO_SAC:
 
                 # TODO: Here the mixture still creates a bit of computational bottleneck
                 # causal_empow = compute_causal_emp(self.ensemble_model, current_states, self.sac_agent)
-                causal_empow = compute_path_ce(self.est_cgm, self.ensemble_model,
-                                               current_states, self.sac_agent)
-                causal_empow_bonus = causal_empow.mean(dim=0)  # shape: (n_batch)
-                std_causal_empow_bonus = causal_empow.std(dim=0)  # shape: (n_batch)
+                causal_empow = compute_path_ce(self.est_cgm, self.ensemble_model, initial_states, self.sac_agent)
+                causal_empow_bonus = causal_empow.mean(dim=0)  # shape: (n_batch, sts_dim)
+                std_causal_empow_bonus = causal_empow.std(dim=0)  # shape: (n_batch, sts_dim)
 
-                rewards += self.causal_eta * causal_empow_bonus.unsqueeze(1)
+                rewards += self.causal_eta * causal_empow_bonus.sum(dim=1, keepdim=True)
 
                 if self.var_causal_bonus:
                     rewards += self.var_causal_eta * std_causal_empow_bonus.unsqueeze(1)
 
-            # We only continue rolling out for samples with active_mask == True
-            # If the uncertainty is above threshold, we turn off that sample
-            for i in range(num_samples):
-                if active_mask[i]:
-                    if ns_jsd[i].item() > jsd_threshold:
-                        active_mask[i] = False
-                    else:
-                        self.imaginary_buffer.push(
-                            initial_states[i].cpu().numpy(),
-                            actions[i].cpu().numpy(),
-                            rewards[i].item(),
-                            next_states[i].cpu().numpy(),
-                            dones[i].item()
-                        )
+            # Compute the mask
+            push_mask = active_mask & (ns_jsd <= jsd_threshold)
 
-            current_states = next_states.detach()
+            # Update active_mask for samples that are still active but exceed the threshold
+            active_mask[active_mask & (ns_jsd > jsd_threshold)] = False
+
+            # Check if any sample should be pushed in this rollout step
+            if push_mask.any():
+                # Get the indices of the samples to push
+                indices_to_push = push_mask.nonzero(as_tuple=True)[0]
+
+                states_to_push = initial_states[indices_to_push].cpu().numpy()
+                actions_to_push = actions[indices_to_push].cpu().numpy()
+                rewards_to_push = rewards[indices_to_push].detach().cpu().numpy()
+                next_states_to_push = next_states[indices_to_push].detach().cpu().numpy()
+                dones_to_push = dones[indices_to_push].cpu().numpy()
+
+                # Push the samples to the imaginary buffer
+                self.imaginary_buffer.push_batch(
+                    states_to_push,
+                    actions_to_push,
+                    rewards_to_push,
+                    next_states_to_push,
+                    dones_to_push
+                )
+
+            initial_states = next_states.detach()
 
         # End of imaginary rollouts
 
@@ -219,17 +251,15 @@ class CMBPO_SAC:
         self.ensemble_model.set_parents_from_prob_matrix(self.est_cgm)
 
         # Plot DAG at the end of the training
-        if self.log_wandb and len(self.real_buffer) % 1_000 == 0:
+        if self.log_wandb and len(self.real_buffer) % (self.cgm_train_freq + 1) == 0:
             fig = self.local_cgm.plot_dag(self.est_cgm, self.true_cgm)
             wandb.log({"Train/Estimated CGM": wandb.Image(fig)})
             plt.close(fig)
 
-    def get_final_buffer(self):
+    def get_final_buffer(self, proportion_real=0.05):
 
-        if len(self.imaginary_buffer) == 0:
-            proportion_real = 0.05
-        else:
-            proportion_real = 0.00
+        if len(self.real_buffer) < 10_000:
+            proportion_real = 0.5
 
         # Function that creates a new ReplayBuffer with the data from the real buffer and imaginary buffer.
         if self.model_based:
@@ -270,21 +300,22 @@ class CMBPO_SAC:
 
         total_steps = 0
         for episode in range(num_episodes):
-            state = self.env.reset()
+            state, _ = self.env.reset()
             episode_reward = 0
             episode_steps = 0
 
             # 1) First chunk: roll an episode within the real environment and populate the real buffer
             for step in range(max_steps):
 
-                if total_steps > 1_000:
+                if total_steps > 5_000:
                     action = self.sac_agent.select_action(state).flatten()
                 else:
                     action = self.env.action_space.sample()
 
-                next_state, reward, done, _ = self.env.step(action)
+                next_state, reward, done, truncated, _ = self.env.step(action)
+                terminal = done or truncated
 
-                self.real_buffer.push(state, action, reward, next_state, done)
+                self.real_buffer.push(state, action, reward, next_state, terminal)
 
                 episode_reward += reward
                 episode_steps += 1
@@ -292,33 +323,54 @@ class CMBPO_SAC:
 
                 state = next_state
 
-                if done:
+                if terminal:
                     break
 
-                # 2) Second chunk: train the dynamics model and populate the imaginary buffer if self.model_based
-                if total_steps % self.model_train_freq == 0 and len(self.real_buffer) > self.batch_size and self.model_based:
+                # 2) Update normalizers every self.model_train_freq steps in model-based training
+                if total_steps % self.model_train_freq == 0 and self.model_based:
 
-                    model_loss = self.update_model(self.batch_size)
+                    batch = self.real_buffer.buffer[-self.model_based:]
+                    states, actions, rewards, next_states, dones = map(np.stack, zip(*batch))
 
-                    # if len(self.real_buffer) > 5_000:
-                    if total_steps > 1_000:
+                    states = torch.FloatTensor(states).to(self.device)
+                    actions = torch.FloatTensor(actions).to(self.device)
+                    next_states = torch.FloatTensor(next_states).to(self.device)
+                    rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
 
+                    # Compute delta_state
+                    delta_states = next_states - states
+
+                    # Concatenate inputs and outputs
+                    model_inputs = torch.cat([states, actions], dim=-1)
+                    targets = torch.cat([delta_states, rewards], dim=-1)
+
+                    # Normalize training data
+                    self.ensemble_model.input_normalizer.update(model_inputs)
+                    self.ensemble_model.output_normalizer.update(targets)
+
+                # All this after the warm-up period of 5_000 steps used to populate the real buffer
+                if total_steps >= 5_000:
+
+                    # 3) Third chunk: train the dynamics model and populate the imaginary buffer if self.model_based
+                    if total_steps % self.model_train_freq == 0 and len(self.real_buffer) > self.batch_size and self.model_based:
+
+                        model_loss = self.update_model(self.batch_size * 4)
                         self.counterfact_rollout()
 
-                # 3) Learn Local Causal Graphical Model from the real buffer
-                # if total_steps % self.cgm_train_freq == 0:  # Learn every self.cgm_train_freq steps
-                if total_steps == self.cgm_train_freq:  # Learn the CGM once at self.cgm_train_freq samples
+                    # 4) Learn Local Causal Graphical Model from the real buffer
+                    # if total_steps % self.cgm_train_freq == 0:  # Learn every self.cgm_train_freq steps
+                    if total_steps == (self.cgm_train_freq + 1):
 
-                    # Learn the CGM with the last self.cgm_train_freq samples
-                    self.update_cgm()
+                        # Learn the CGM with the last self.cgm_train_freq samples
+                        self.update_cgm()
 
-                # 4) Third chunk: train the SAC agent
-                if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
+                    # 5) Fifth chunk: train the SAC agent
+                    if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
 
-                    for _ in range(self.agent_steps):
+                        for _ in range(self.agent_steps):
 
-                        final_buffer = self.get_final_buffer()
-                        critic_loss, actor_loss, alpha_loss = self.sac_agent.update(final_buffer, self.batch_size)
+                            final_buffer = self.get_final_buffer()
+                            critic_loss, actor_loss, alpha_loss = self.sac_agent.update(final_buffer, self.batch_size)
 
             # 4) Logging and Printing
             if self.log_wandb:

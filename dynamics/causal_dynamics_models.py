@@ -4,6 +4,37 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 
+class RunningNormalizer:
+    def __init__(self, size, device, eps=1e-8):
+        self.mean = torch.zeros(size, device=device)
+        self.var = torch.ones(size, device=device)
+        self.count = torch.tensor(eps, device=device)
+
+    def update(self, x: torch.Tensor):
+        batch_mean = x.mean(dim=0)
+        batch_var = x.var(dim=0, unbiased=False)
+        batch_count = x.size(0)
+
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta.pow(2) * self.count * batch_count / total_count
+        new_var = M2 / total_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = total_count
+
+    def normalize(self, x):
+        return (x - self.mean) / (self.var.sqrt() + 1e-8)
+
+    def denormalize(self, x):
+        return x * (self.var.sqrt() + 1e-8) + self.mean
+
+
 class FactorizedEnsembleModel(nn.Module):
     """
     A collection of (state_dim + 1) deep ensemble models. Each ensemble predicts one scalar
@@ -12,7 +43,7 @@ class FactorizedEnsembleModel(nn.Module):
     for each dimension. This factorization ensures each dimension can see only
     the inputs we decide, if we like.
     """
-    def __init__(self, state_dim, action_dim, hidden_units=64, ensemble_size=10, lr=0.001, device='cpu'):
+    def __init__(self, state_dim, action_dim, device, hidden_units=200, ensemble_size=10, lr=0.001):
         super(FactorizedEnsembleModel, self).__init__()
 
         self.state_dim = state_dim
@@ -21,6 +52,8 @@ class FactorizedEnsembleModel(nn.Module):
         self.ensemble_size = ensemble_size
         self.hidden_units = hidden_units
         self.device = device
+
+        self.min_logvar, self.max_logvar = torch.tensor(-10.0, device=device), torch.tensor(5.0, device=device)
 
         # We will store a separate "ModuleList of MLPs" for each dimension:
         #   dimension_models[d] is a ModuleList of length 'ensemble_size'
@@ -38,9 +71,12 @@ class FactorizedEnsembleModel(nn.Module):
         # Create a single optimizer for all the models parameters
         self.model_optimizer = optim.Adam(self.parameters(), lr=lr)
 
-        # Store the mean and std of the inputs
-        self.mean = None
-        self.std = None
+        # Initialize running normalizers for inputs and outputs
+        self.input_normalizer = RunningNormalizer(state_dim + action_dim, device)
+        self.output_normalizer = RunningNormalizer(state_dim + 1, device)
+
+        # Put everything on the device
+        self.to(device)
 
     def forward(self, x):
         """
@@ -66,27 +102,18 @@ class FactorizedEnsembleModel(nn.Module):
                 pred = model_k(x)  # shape (batch, 2)
                 mean_k = pred[:, 0:1]  # shape (batch,1)
                 logvar_k = pred[:, 1:2]  # shape (batch,1)
+
+                # Constrain logvar to be within [min_logvar, max_logvar]
+                constr_logvar_k = self.max_logvar - F.softplus(self.max_logvar - logvar_k)
+                constr_logvar_k = self.min_logvar + F.softplus(constr_logvar_k - self.min_logvar)
+
                 means_dim.append(mean_k)
-                logvars_dim.append(logvar_k)
+                logvars_dim.append(constr_logvar_k)
 
             means_all.append(means_dim)  # length ensemble_size
             logvars_all.append(logvars_dim)  # length ensemble_size
 
         return means_all, logvars_all
-    
-    def normalize_inputs(self, x):
-        """
-        Normalize the inputs to have zero mean and unit variance.
-        """
-        self.mean = x.mean(dim=0)
-        self.std = x.std(dim=0) + 1e-6
-        return (x - self.mean) / self.std
-    
-    def denormalize_outputs(self, x):
-        """
-        Denormalize the outputs to the original scale.
-        """
-        return x * self.std + self.mean
 
     def set_parents_from_prob_matrix(self, adjancency):
         """
@@ -131,7 +158,7 @@ class FactorizedEnsembleModel(nn.Module):
                         # Zero out the entire column i_in
                         first_layer.weight.data[:, i_in].zero_()
 
-    def train_factorized_ensemble(self, buffer, batch_size, epochs=50):
+    def train_factorized_ensemble(self, buffer, batch_size, epochs=100):
         """
         real_batch: a tuple (states, actions, next_states, rewards)
           - states.shape = (N, state_dim)
@@ -139,6 +166,13 @@ class FactorizedEnsembleModel(nn.Module):
           - next_states.shape= (N, state_dim)
           - rewards.shape= (N,)
         """
+
+        if len(buffer) < 50_000:
+            epochs = epochs * 10
+        elif len(buffer) < 150_000:
+            epochs = epochs * 5
+        else:
+            epochs = epochs
 
         for epoch in range(epochs):
 
@@ -150,11 +184,17 @@ class FactorizedEnsembleModel(nn.Module):
             next_states= torch.FloatTensor(next_states).to(self.device)
             rewards    = torch.FloatTensor(rewards).to(self.device).unsqueeze(-1)  # shape (N,1)
 
-            # We'll merge next_states & rewards into a single target => shape (N, state_dim+1)
-            targets = torch.cat([next_states, rewards], dim=1)  # shape (N, state_dim+1)
+            # Compute delta state
+            delta_state = next_states - states
 
-            # 1) Forward
+            # We'll merge next_states & rewards into a single target => shape (N, state_dim+1)
             inputs = torch.cat([states, actions], dim=1)  # shape (N, state_dim+action_dim)
+            targets = torch.cat([delta_state, rewards], dim=1)  # shape (N, state_dim+1)
+
+            # Normalize inputs and targets
+            inputs = self.input_normalizer.normalize(inputs)
+            targets = self.output_normalizer.normalize(targets)
+
             means_all, logvars_all = self(inputs)
 
             # means_all[d][k] => shape (N,1)
@@ -164,6 +204,7 @@ class FactorizedEnsembleModel(nn.Module):
             #    For dimension d, the target is targets[:, d], shape (N,)
             #    We'll do a small sum
             total_loss = 0
+            self.model_optimizer.zero_grad()
             for d in range(self.dimensions):
                 y = targets[:, d:d+1]  # shape (N,1)
                 for k in range(self.ensemble_size):
@@ -175,8 +216,10 @@ class FactorizedEnsembleModel(nn.Module):
                     nll_k = 0.5*(logvar + (y - mu)**2 / var)
                     total_loss += nll_k.mean()
 
+                # Average over ensemble members
+                total_loss /= self.ensemble_size
+
             # 3) Backprop
-            self.model_optimizer.zero_grad()
             total_loss.backward()
             self.model_optimizer.step()
 
