@@ -29,15 +29,15 @@ def set_device():
 
 class CMBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, pure_imaginary=True,
-                 sl_method="PC", bootstrap=None, n_bootstrap=100, cgm_train_freq=5_000,
-                 causal_bonus=True, causal_eta=0.01, var_causal_bonus=False, var_causal_eta=0.001,
+                 steps_per_epoch=1_000,
+                 sl_method="PC", bootstrap=None, n_bootstrap=100, cgm_train_freq=6_000,
+                 causal_bonus=True, causal_eta=0.1, var_causal_bonus=False, var_causal_eta=0.01,
                  jsd_bonus=False, jsd_eta=0.01, jsd_thres=1.0,
                  lr_model=1e-3,
                  lr_sac=0.0003, agent_steps=10, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=1,
                  rollout_per_step=400,  # Maybe put 100_000 as it is batched anyway
                  update_size=256, sac_train_freq=1, model_train_freq=250, batch_size=256):
 
-        steps_per_epoch = 1_000
         self.env = env
         self.seed = seed
         self.log_wandb = log_wandb
@@ -202,11 +202,12 @@ class CMBPO_SAC:
             # TODO:  NB, Here we pick a single ensemble member for each batch sample to keep consistent graphs
             # ensemble_idx = torch.randint(self.ensemble_model.ensemble_size, (1,)).item()
             # mean_pred, log_var_pred = all_preds_mean[ensemble_idx], all_preds_var[ensemble_idx]
-            batch_idx = torch.arange(num_samples, device=self.device)
-            mean_pred = all_preds_mean[ensemble_idx, batch_idx]
+            head_idx = torch.randint(self.ensemble_model.ensemble_size, (num_samples,), device=self.device)
+            mean_pred = all_preds_mean[head_idx, torch.arange(num_samples)]
 
             # Pick normalized rewards
             reward_pred = mean_pred[:, -1].clone().unsqueeze(1)
+            reward_original = reward_pred.clone().detach()
 
             # Compute uncertainty as disagreement across ensemble (JSD) - can use it also as intrinsic reward
             ns_jsd = compute_jsd(all_preds_mean, torch.exp(all_preds_var))
@@ -227,21 +228,14 @@ class CMBPO_SAC:
                 reward_std = self.ensemble_model.output_normalizer.var[-1].detach().clamp_min(1e-6).sqrt()
                 de_meaned_ce = causal_empow_bonus - causal_empow_bonus.mean(dim=0)
 
-                causal_bonus_tot = self.causal_eta * (de_meaned_ce.sum(dim=1, keepdim=True) / (reward_std + 1e-6))
+                norm_ce = (de_meaned_ce.sum(dim=1, keepdim=True) / (reward_std + 1e-6))
+
+                causal_bonus_tot = self.causal_eta * norm_ce
                 reward_pred += causal_bonus_tot
 
                 if self.var_causal_bonus:
                     std_bonus = (std_causal_empow_bonus.sum(dim=1, keepdim=True) / (reward_std + 1e-6))
                     reward_pred += self.var_causal_eta * std_bonus
-
-                # # Normalize the causal empowerment before adding it to the reward
-                # causal_empow_bonus = (causal_empow_bonus - causal_empow_bonus.mean(dim=0)) / (causal_empow_bonus.std(dim=0) + 1e-8)
-                #
-                # causal_bonus_tot = self.causal_eta * causal_empow_bonus.sum(dim=1, keepdim=True)
-                # reward_pred += causal_bonus_tot
-                #
-                # if self.var_causal_bonus:
-                #     reward_pred += self.var_causal_eta * std_causal_empow_bonus.sum(dim=1, keepdim=True)
 
             # Replace the reward prediction with the augmented one
             mean_pred[:, -1] = reward_pred.squeeze(1)
@@ -284,6 +278,14 @@ class CMBPO_SAC:
             initial_states = next_states.detach()
 
         # End of imaginary rollouts
+
+        # If wandb is enabled, log the normal rewards and causal rewards
+        if self.log_wandb:
+            wandb.log({
+                "Train/Normal Rewards": reward_original.mean().item(),
+                "Train/Causal Rewards": norm_ce.mean().item(),
+                "Train/Uncertainty": ns_jsd.mean().item()
+            })
 
     def update_cgm(self):
 
@@ -408,8 +410,8 @@ class CMBPO_SAC:
                         self.counterfact_rollout()
 
                     # 4) Learn Local Causal Graphical Model from the real buffer
-                    # if total_steps % self.cgm_train_freq == 0:  # Re-Learn every self.cgm_train_freq steps
-                    if total_steps == (self.cgm_train_freq + 1):
+                    if total_steps % (self.cgm_train_freq + 1) == 0 and self.model_based:
+                    # if total_steps == (self.cgm_train_freq + 1) and self.model_based:
 
                         # Learn the CGM with the last self.cgm_train_freq samples
                         self.update_cgm()

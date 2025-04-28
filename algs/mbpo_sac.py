@@ -25,11 +25,10 @@ def set_device():
 
 class MBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, lr_model=1e-3,
+                 steps_per_epoch=1_000,
                  lr_sac=0.0003, agent_steps=10, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=1,
-                 rollout_per_step=400,  # Maybe put 100_000 as it is batched anyway
-                 update_size=256, sac_train_freq=1, model_train_freq=250, batch_size=256):
+                 rollout_per_step=400, update_size=256, sac_train_freq=1, model_train_freq=250, batch_size=256):
 
-        steps_per_epoch = 1_000
         self.env = env
         self.seed = seed
         self.log_wandb = log_wandb

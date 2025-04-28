@@ -79,6 +79,8 @@ class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, max_action, hidden_dim=256):
         super(Actor, self).__init__()
 
+        self.action_dim = action_dim
+
         self.net = nn.Sequential(
             layer_init(nn.Linear(state_dim, hidden_dim)),
             nn.ReLU(),
@@ -87,48 +89,31 @@ class Actor(nn.Module):
             layer_init(nn.Linear(hidden_dim, 2 * action_dim), std=0.01)
         )
 
-        self.log_std_min = -5.0
-        self.log_std_max = 2.0
+        self.log_std_min, self.log_std_max = -20.0, 2.0
         self.max_action = max_action
 
     def forward(self, state):
+        x = self.net(state)
+        mean, log_std = x.split(self.action_dim, dim=-1)
 
-        out = self.net(state)
-
-        # Split mean and log_std
-        mean, log_std = out.chunk(2, dim=-1)
-
-        # Clamp log_std to be within the specified range
+        # --------- NUMERICAL GUARDS ----------------------------------
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-
-        # Replace any NaN / ±Inf that survived clamp (can happen if `out` had NaN)
-        bad_mask = torch.isnan(log_std) | torch.isinf(log_std)
-        if bad_mask.any():
-            log_std[bad_mask] = self.log_std_min
-
-        # Convert log_std to std
-        std = log_std.exp().clamp_min(1e-6)
-
-        return mean, std
+        mean    = torch.nan_to_num(mean, nan=0.0)                  # ❹ no in-place write!
+        return mean, log_std
 
     def sample(self, state):
-        mean, std = self.forward(state)
+        mean, log_std = self(state)
+        std = log_std.exp()
 
-        # Sometimes the mean is not a Real number, so we need to handle this
-        if torch.isnan(mean).any() or torch.isinf(mean).any():
+        normal = torch.distributions.Normal(mean, std)
+        z = normal.rsample()  # re-parameterised Gaussian noise
+        action = torch.tanh(z)  # squash to (-1,1)
 
-            # Replace the non-real numbers with 0
-            mean[torch.isnan(mean)] = 0
-            mean[torch.isinf(mean)] = 0
+        # log π(a|s) with stable tanh-Jacobian
+        log_prob = normal.log_prob(z)  # N(mean,σ)
+        log_prob -= torch.log1p(-action.pow(2) + 1e-6)  # ❺ log(1-tanh²)+ϵ
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
 
-        normal = Normal(mean, std)
-        x_t = normal.rsample()  # re-parameterization trick
-        action = torch.tanh(x_t)
-        log_prob = normal.log_prob(x_t)
-
-        # Enforcing Action Bound
-        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
         return action * self.max_action, log_prob
 
 
@@ -216,6 +201,9 @@ class SAC:
             target_q1, target_q2 = self.critic_target(next_state, next_action)
             min_qf_next_target = torch.min(target_q1, target_q2) - self.alpha * next_log_pi
             next_q_value = reward + (1 - done) * self.gamma * min_qf_next_target
+
+            # Clamp the target Q-values to avoid overestimation
+            next_q_value = torch.clamp(next_q_value, -1e6, 1e6)
 
         current_q1, current_q2 = self.critic(state, action)
         critic_loss = F.mse_loss(current_q1, next_q_value) + F.mse_loss(current_q2, next_q_value)
