@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import gym
 
-from algs.cmbpo_sac_ensemble import CMBPO_SAC, set_device  # type: ignore
+from algs.cmbpo_sac import CMBPO_SAC, set_device  # type: ignore
 
 
 def str2bool(v):

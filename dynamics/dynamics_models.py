@@ -89,3 +89,9 @@ class EnsembleModel(nn.Module):
 
         return means, logvars
 
+
+def mbpo_nll(pred_mean, pred_logvar, target):
+    """Numerically stable NLL used by the original MBPO code."""
+    inv_var = torch.exp(-pred_logvar)            #  1 / σ²
+    nll = (pred_logvar + (target - pred_mean).pow(2) * inv_var)
+    return nll.mean()                       # per‑batch scalar

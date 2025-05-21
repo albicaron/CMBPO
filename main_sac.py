@@ -7,7 +7,8 @@ from typing import Optional
 
 import numpy as np
 import torch
-import gym
+import gymnasium as gym
+import gymnasium_robotics
 
 from algs.mbpo_sac import MBPO_SAC, set_device  # type: ignore
 
@@ -22,10 +23,10 @@ def str2bool(v):
     raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def make_env(env_name: str) -> gym.Env:
+def make_env(env_name: str, max_episode_steps: int) -> gym.Env:
     """Create a Gymnasium environment."""
     try:
-        return gym.make(env_name)  # type: ignore[return-value]
+        return gym.make(env_name, max_episode_steps=max_episode_steps)  # type: ignore[return-value]
     except gym.error.Error as exc:
         raise ValueError(f'Unknown environment id {env_name!r}. It must be registered with Gymnasium.') from exc
 
@@ -38,18 +39,20 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
 
     # Environment options
-    parser.add_argument('--env', '-e', default='HalfCheetah-v4', help='Gymnasium environment ID.')
+    parser.add_argument('--env', '-e',
+                        default='HalfCheetah-v4',
+                        help='Gymnasium environment ID.')
     parser.add_argument('--seed', '-s', type=int, default=0, help='Random seed for NumPy and PyTorch.')
 
     # Training hyper‑parameters
-    parser.add_argument('--episodes', '-n', type=int, default=200, help='Total number of training episodes.')
+    parser.add_argument('--episodes', '-n', type=int, default=50, help='Total number of training episodes.')
     parser.add_argument('--steps', '-t', type=int, default=1_000, help='Maximum env steps per episode.')
 
     # The next is a "model-based" flag, but it is not used in the code as it is always true
     parser.add_argument('--model_based',
                         type=str2bool,
-                        default=True,
-                        help='Enable model-based policy optimization (CMBPO). Set to False to disable.')
+                        default=False,
+                        help='Enable model-based policy optimization (MBPO). Set to False to disable.')
 
     # Logging and output
     parser.add_argument('--log_wandb',
@@ -78,11 +81,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     device = set_device()
 
     # Environment -------------------------------------------------------------
-    env = make_env(args.env)
+    gym.register_envs(gymnasium_robotics)
+    env = make_env(args.env, max_episode_steps=args.steps)
 
     # Agent -------------------------------------------------------------------
-    agent = MBPO_SAC(env, args.seed, device,
-                     steps_per_epoch=args.steps,
+    agent = MBPO_SAC(env,
+                     args.seed,
+                     device,
                      log_wandb=args.log_wandb,
                      model_based=args.model_based)
 

@@ -2,9 +2,11 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 
-from algs.sac import SAC, ReplayBuffer
-from dynamics.utils import compute_jsd
-from dynamics.dynamics_models import EnsembleModel
+from algs.sac import SAC, ReplayBuffer, HERReplayBuffer
+from dynamics.utils import compute_jsd, linear_scheduler, flatten_obs
+from dynamics.dynamics_models import EnsembleModel, mbpo_nll
+
+from gymnasium.spaces import Dict
 
 import wandb
 import time
@@ -25,9 +27,17 @@ def set_device():
 
 class MBPO_SAC:
     def __init__(self, env, seed, dev, log_wandb=True, model_based=False, lr_model=1e-3,
-                 steps_per_epoch=1_000,
-                 lr_sac=0.0003, agent_steps=10, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=1,
-                 rollout_per_step=400, update_size=256, sac_train_freq=1, model_train_freq=250, batch_size=256):
+                 lr_sac=0.0003, agent_steps=40, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=1,
+                 rollout_schedule=None, rollout_per_step=400, update_size=256, sac_train_freq=1, model_train_freq=250,
+                 batch_size=256, eval_freq=1_000, eval_episodes=10):
+
+        if rollout_schedule is None:
+            self.rollout_schedule = [20_000, 100_000, 1, 15]  # ← change
+        else:
+            self.rollout_schedule = rollout_schedule
+
+        self.eval_freq = eval_freq
+        self.eval_episodes = eval_episodes
 
         self.env = env
         self.seed = seed
@@ -35,7 +45,18 @@ class MBPO_SAC:
         self.model_based = model_based
         self.alg_name = 'MBPO_SAC' if self.model_based else 'SAC'
 
-        self.state_dim = env.observation_space.shape[0]
+        if isinstance(env.observation_space, Dict):
+            self.env_type = "gym_robotics"
+            self.state_dim = (
+                    env.observation_space["observation"].shape[0] +
+                    env.observation_space["desired_goal"].shape[0]
+            )
+            self.warmup_steps = 500
+        else:
+            self.env_type = "gym_mujoco"
+            self.state_dim = env.observation_space.shape[0]
+            self.warmup_steps = 5_000
+
         self.action_dim = env.action_space.shape[0]
         self.max_action = float(env.action_space.high[0])
 
@@ -48,6 +69,7 @@ class MBPO_SAC:
         self.update_size = update_size  # Size of the final buffer to train the SAC agent made of %5-95% real-imaginary
 
         # The agent steps are 1 for SAC and agent_steps for MBPO
+        self.total_steps = 0
         self.agent_steps = agent_steps if self.model_based else 1
         self.sac_train_freq = sac_train_freq
         self.model_train_freq = model_train_freq
@@ -58,57 +80,137 @@ class MBPO_SAC:
 
         self.sac_agent = SAC(self.state_dim, self.action_dim, self.max_action, lr=lr_sac, gamma=gamma,
                              tau=tau, alpha=alpha, device=self.device)
-
         self.ensemble_model = EnsembleModel(state_dim=self.state_dim, action_dim=self.action_dim, lr=lr_model,
-                                            device=self.device, ensemble_size=5).to(self.device)
+                                            device=self.device, ensemble_size=7).to(self.device)
+        self.elite_size = 5
+        self.elite_idxs = list(range(self.elite_size))   # fallback before the first update
 
-        self.real_buffer = ReplayBuffer(int(1_000_000))
-        self.imaginary_buffer = ReplayBuffer(int(rollout_per_step * steps_per_epoch))  # 1_000 * 400 = 400_000
-
-    def update_model(self, batch_size=256, epochs=100):
-
-        if len(self.real_buffer) < 50_000:
-            epochs = epochs * 10
-        elif len(self.real_buffer) < 150_000:
-            epochs = epochs * 5
+        # self.real_buffer = ReplayBuffer(int(1_000_000))
+        if self.env_type == "gym_robotics":
+            self.real_buffer = HERReplayBuffer(int(1_000_000), env, her_k=4)
         else:
-            epochs = epochs
+            self.real_buffer = ReplayBuffer(int(1_000_000))
+        self.imaginary_buffer = ReplayBuffer(int(1_000_000))
 
-        for _ in range(epochs):
+    def update_model(
+        self,
+        batch_size: int = 256,
+        max_epochs: int = 20,          # hard cap (MBPO default)
+        min_epochs: int = 10,            # early‑stop can only trigger after this
+        patience: int = 5,              # “epochs since any net improved”
+        val_split: float = 0.2,         # 20% hold‑out
+        improvement_threshold: float = 0.01  # 1% relative improvement
+    ):
+        """
+        Train the dynamics ensemble exactly as in the original MBPO implementation:
+        * fixed 80/20 train–hold‑out split of *all* real data;
+        * each epoch is one complete pass over the train split;
+        * per‑network early stopping with best‑snapshot restore.
+        Returns the mean final hold‑out loss across the ensemble.
+        """
 
-            state, action, reward, next_state, done = self.real_buffer.sample(batch_size)
+        if len(self.real_buffer) < batch_size:     # not enough data yet
+            return 0.0
 
-            state = torch.FloatTensor(state).to(self.device)
-            action = torch.FloatTensor(action).to(self.device)
-            next_state = torch.FloatTensor(next_state).to(self.device)
-            reward = torch.FloatTensor(reward).to(self.device).unsqueeze(1)
+        # ------------------------------------------------------------------ #
+        # 0. Build the full data set (on CPU to save GPU RAM)
+        # ------------------------------------------------------------------ #
+        s, a, r, ns, _ = map(np.stack, zip(*self.real_buffer.buffer))
+        r = r.reshape(-1, 1)
+        delta_s = ns - s
 
-            # Compute delta state
-            delta_state = next_state - state
+        inputs  = torch.from_numpy(np.concatenate([s, a], axis=1)).float()
+        targets = torch.from_numpy(np.concatenate([delta_s, r], axis=1)).float()
 
-            model_input = torch.cat([state, action], dim=1)
-            next_s_rew = torch.cat([delta_state, reward], dim=1)
+        N = inputs.size(0)
+        n_hold = int(val_split * N)
 
-            # Normalize the inputs and outputs
-            model_input = self.ensemble_model.input_normalizer.normalize(model_input)
-            next_s_rew = self.ensemble_model.output_normalizer.normalize(next_s_rew)
+        perm = torch.randperm(N)
+        val_idx, train_idx = perm[:n_hold], perm[n_hold:]
 
-            mean_preds, logvar_preds = self.ensemble_model(model_input)
+        train_in, train_tg = inputs[train_idx], targets[train_idx]
+        val_in,   val_tg   = inputs[val_idx],   targets[val_idx]
 
-            model_loss = 0
-            self.ensemble_model.model_optimizer.zero_grad()
-            for mean_pred, logvar_pred in zip(mean_preds, logvar_preds):
+        # One‑off normalisation & device transfer for the hold‑out
+        val_in = self.ensemble_model.input_normalizer.normalize(val_in.to(self.device))
+        val_tg = self.ensemble_model.output_normalizer.normalize(val_tg.to(self.device))
 
-                var_pred = torch.exp(logvar_pred)
-                model_loss += F.gaussian_nll_loss(mean_pred, next_s_rew, var_pred, reduction='mean')
+        # ------------------------------------------------------------------ #
+        # 1. Initial hold‑out evaluation  ➜  fills best_val with *finite* numbers
+        # ------------------------------------------------------------------ #
+        E = self.ensemble_model.ensemble_size
+        best_val, best_snap = [], []
 
-            # Compute the total loss
-            model_loss /= self.ensemble_model.ensemble_size
+        with torch.no_grad():
+            init_mean, init_logvar = self.ensemble_model(val_in)
+            for i, (m, lv) in enumerate(zip(init_mean, init_logvar)):
+                # vloss = F.gaussian_nll_loss(m, val_tg, torch.exp(lv), reduction='mean').item()
+                vloss = mbpo_nll(pred_mean=m, pred_logvar=lv, target=val_tg).item()
+                best_val.append(vloss)
+                best_snap.append({k: v.detach().cpu() for k, v in self.ensemble_model.models[i].state_dict().items()})
 
-            model_loss.backward()
-            self.ensemble_model.model_optimizer.step()
+        # ------------------------------------------------------------------ #
+        # 2. Training loop: full‑data sweep per epoch
+        # ------------------------------------------------------------------ #
+        epochs_since_update = 0
+        for epoch in range(max_epochs):
 
-        return model_loss.item()
+            # shuffle once per epoch
+            idx = torch.randperm(train_in.size(0))
+            train_in, train_tg = train_in[idx], train_tg[idx]
+
+            for start in range(0, train_in.size(0), batch_size):
+                end = start + batch_size
+                b_in  = train_in[start:end].to(self.device)
+                b_tg  = train_tg[start:end].to(self.device)
+
+                # normalise on‑device
+                b_in = self.ensemble_model.input_normalizer.normalize(b_in)
+                b_tg = self.ensemble_model.output_normalizer.normalize(b_tg)
+
+                self.ensemble_model.model_optimizer.zero_grad()
+                mean, logvar = self.ensemble_model(b_in)
+
+                loss = 0.0
+                for m, lv in zip(mean, logvar):
+                    # loss += F.gaussian_nll_loss(m, b_tg, torch.exp(lv), reduction='mean')
+                    loss += mbpo_nll(pred_mean=m, pred_logvar=lv, target=b_tg)
+                (loss / E).backward()
+                self.ensemble_model.model_optimizer.step()
+
+            # ---------------- hold‑out evaluation ---------------- #
+            with torch.no_grad():
+                v_mean, v_logvar = self.ensemble_model(val_in)
+
+                improved = False
+                for i, (m, lv) in enumerate(zip(v_mean, v_logvar)):
+                    # vloss = F.gaussian_nll_loss(m, val_tg, torch.exp(lv), reduction='mean').item()
+                    vloss = mbpo_nll(pred_mean=m, pred_logvar=lv, target=val_tg).item()
+
+                    # relative improvement > 1%  (works even at first pass)
+                    if (best_val[i] - vloss) / abs(best_val[i]) > improvement_threshold:
+                        best_val[i] = vloss
+                        best_snap[i] = {k: v.detach().cpu()for k, v in self.ensemble_model.models[i].state_dict().items()}
+                        improved = True
+
+            epochs_since_update = 0 if improved else epochs_since_update + 1
+            if epoch + 1 >= min_epochs and epochs_since_update > patience:
+                break
+
+        # ------------------------------------------------------------------ #
+        # 3. Restore the best snapshot for each ensemble member
+        # ------------------------------------------------------------------ #
+        for i, snap in enumerate(best_snap):
+            if snap is not None:
+                self.ensemble_model.models[i].load_state_dict(snap)
+
+        # ------------------------------------------------------------------ #
+        # 4. Pick the 5 heads with the lowest hold‑out loss  (elite set)
+        # ------------------------------------------------------------------ #
+        elite_idxs = np.argsort(best_val)[: self.elite_size].tolist()
+        self.elite_idxs = elite_idxs  # ←  stored for rollouts
+
+        return float(np.mean(best_val))
 
     def imaginary_rollout(self):
         """
@@ -123,27 +225,18 @@ class MBPO_SAC:
         """
 
          # Augment max_length_traj by 1 every 10_000 steps
-        add_on = 0
-        if len(self.real_buffer) > 200_000:
-            add_on = int(len(self.real_buffer) / 200_000)
-
-        max_length_traj = self.max_rollout_len + add_on
+        max_length_traj = linear_scheduler(self.rollout_schedule, self.total_steps)
 
         # Number of rollouts to generate from the real buffer
-        num_samples = min(self.num_model_rollouts, len(self.real_buffer))
+        num_samples = int(self.num_model_rollouts // max_length_traj)  # keeps the seed fixed to the number of rollouts
 
-        if num_samples == 0:
-            return
-
-        initial_states, _, _, _, _ = self.real_buffer.sample(num_samples)
+        initial_states, _, _, _, _ = self.real_buffer.sample(num_samples, replace=True)
         initial_states = torch.FloatTensor(initial_states).to(self.device)
 
-        # Whether we should continue for each sample in the batch
         # "active_mask[i] = False" => stop rolling out sample i
         active_mask = torch.ones(num_samples, dtype=torch.bool, device=self.device)
 
-        # Let us define a hyperparameter or heuristic threshold for "too high" variance
-        # In practice, you can tune this threshold or make it adapt over time.
+        # JSD threshold for stopping the rollout
         jsd_threshold = 1.0  # or any other measure you want
 
         for t in range(max_length_traj):
@@ -157,30 +250,39 @@ class MBPO_SAC:
 
             model_input = torch.cat([initial_states, actions], dim=1)
 
-            # Ensemble predictions: shape [ensemble_size, batch_size, next_state_dim+1]
-            # Normalize the inputs
+            # Normalize the inputs. Ensemble predictions: shape [ensemble_size, batch_size, next_state_dim+1]
             model_input = self.ensemble_model.input_normalizer.normalize(model_input)
             with torch.no_grad():
                 mean_preds, logvar_preds = self.ensemble_model(model_input)
-            all_preds_mean, all_preds_var = torch.stack(mean_preds, dim=0), torch.stack(logvar_preds, dim=0)
+            all_preds_mean, all_preds_logvar = torch.stack(mean_preds, dim=0), torch.stack(logvar_preds, dim=0)
 
             # Next state is sampled from the ensemble
-            head_idx = torch.randint(self.ensemble_model.ensemble_size, (num_samples,), device=self.device)
+            # head_idx = torch.randint(self.ensemble_model.ensemble_size, (num_samples,), device=self.device)
+            elite_tensor = torch.tensor(self.elite_idxs, device=self.device)
+            # safety: if elites not set yet, fall back to all heads
+            if len(elite_tensor) == 0:
+                elite_tensor = torch.arange(self.ensemble_model.ensemble_size, device=self.device)
+            head_idx = elite_tensor[torch.randint(len(elite_tensor), (num_samples,), device=self.device)]
             mean_pred = all_preds_mean[head_idx, torch.arange(num_samples)]
-            # mean_pred = all_preds_mean.mean(dim=0)
+            logvar_pred = all_preds_logvar[head_idx, torch.arange(num_samples)]
+
+            # Add model noise
+            # std_pred = torch.exp(0.5 * logvar_pred).clamp(max=0.25)  # σ ≤ 0.25 (normalised)
+            std_pred = torch.exp(0.5 * logvar_pred).clamp(max=0.5)  # σ ≤ 0.5 (normalised)
+            noise = torch.randn_like(mean_pred) * std_pred
+            mean_pred = mean_pred + noise
 
             # De-normalize the outputs
             denorm_mean_pred = self.ensemble_model.output_normalizer.denormalize(mean_pred)
 
             delta_next_state = denorm_mean_pred[:, :-1]
-            # Add the state back
-            next_states = initial_states + delta_next_state
+            next_states = initial_states + delta_next_state  # Add delta to the current state
 
             rewards = denorm_mean_pred[:, -1].unsqueeze(1)
             dones = torch.zeros_like(rewards)
 
             # Compute uncertainty as disagreement across ensemble (JSD)
-            ns_jsd = compute_jsd(all_preds_mean, torch.exp(all_preds_var))
+            ns_jsd = compute_jsd(all_preds_mean, torch.exp(all_preds_logvar))
 
             # Compute the mask
             push_mask = active_mask & (ns_jsd <= jsd_threshold)
@@ -214,8 +316,18 @@ class MBPO_SAC:
 
     def get_final_buffer(self, proportion_real=0.05):
 
-        if len(self.real_buffer) < 10_000:
-            proportion_real = 0.5
+        # For Mujoco
+        if self.env_type == "gym_mujoco":
+            if len(self.real_buffer) < (self.warmup_steps + 1_000):
+                proportion_real = 0.5
+            else:
+                proportion_real = 0.05
+        else:
+            # For Gym-Robotics
+            if len(self.real_buffer) < self.warmup_steps:
+                proportion_real = 0.5
+            else:
+                proportion_real = 0.05
 
         # Function that creates a new ReplayBuffer with the data from the real buffer and imaginary buffer.
         if self.model_based:
@@ -254,36 +366,57 @@ class MBPO_SAC:
                        name=f"{self.alg_name}_SAC_seed_{self.seed}_time_{time.time()}",
                        config=self.__dict__, group=self.alg_name, dir='/tmp')
 
-        total_steps = 0
-        for episode in range(num_episodes):
-            state, _ = self.env.reset()
+        episode = 0
+        target_steps = num_episodes * max_steps
+
+        while self.total_steps < target_steps:
+
+            if self.env_type == "gym_robotics":
+                state_dict, _ = self.env.reset()
+                state = flatten_obs(state_dict)
+            else:
+                state, _ = self.env.reset()
+
             episode_reward = 0
             episode_steps = 0
 
             # 1) First chunk: roll an episode with the real environment and populate the real buffer
             for step in range(max_steps):
 
-                if total_steps > 5_000:
+                if self.total_steps > self.warmup_steps:
                     action = self.sac_agent.select_action(state).flatten()
                 else:
                     action = self.env.action_space.sample()
 
-                next_state, reward, done, truncated, _ = self.env.step(action)
-                terminal = done or truncated
+                if self.env_type == "gym_robotics":
+                    next_state_dict, reward, done, truncated, _ = self.env.step(action)
+                    next_state = flatten_obs(next_state_dict)
+                    terminal = done or truncated
 
-                self.real_buffer.push(state, action, reward, next_state, terminal)
+                    # For HER
+                    self.real_buffer.push_transition(state,  action,reward, next_state,  terminal,
+                                                     state_dict["achieved_goal"], next_state_dict["achieved_goal"],
+                                                     state_dict["desired_goal"])
 
+                    # Shift state_dict to next_state_dict
+                    state_dict = next_state_dict
+                else:
+                    next_state, reward, done, truncated, _ = self.env.step(action)
+                    terminal = done or truncated
+                    self.real_buffer.push(state, action, reward, next_state, terminal)
+
+                # Set state to next_state and increment the episode reward and steps
+                state = next_state
                 episode_reward += reward
                 episode_steps += 1
-                total_steps += 1
+                self.total_steps += 1
 
-                state = next_state
-
-                if terminal:
-                    break
+                # 2) Every self.eval_freq steps, evaluate the policy on deterministic actions
+                if self.total_steps % self.eval_freq == 0 and self.total_steps > 0:
+                    self._evaluate_policy()
 
                 # 2) Update normalizers every self.model_train_freq steps in model-based training
-                if total_steps % self.model_train_freq == 0 and self.model_based:
+                if self.total_steps % self.model_train_freq == 0 and self.model_based:
 
                     batch = self.real_buffer.buffer[-self.model_train_freq:]
                     states, actions, rewards, next_states, dones = map(np.stack, zip(*batch))
@@ -304,32 +437,36 @@ class MBPO_SAC:
                     self.ensemble_model.input_normalizer.update(model_inputs)
                     self.ensemble_model.output_normalizer.update(targets)
 
-                # All this after the warm-up period of 5_000 steps used to populate the real buffer
-                if total_steps >= 5_000:
+                    # Train the model
+                    if len(self.real_buffer) > (self.batch_size):
+                        # Train the model
+                        model_loss = self.update_model(self.batch_size)
+
+                # All this after the warm-up period of warmup_steps steps used to populate the real buffer
+                if self.total_steps >= self.warmup_steps:
 
                     # 3) Third chunk: train the dynamics model
-                    if total_steps % self.model_train_freq == 0 and len(self.real_buffer) > self.batch_size and self.model_based:
-
-                        # Train the model
-                        model_loss = self.update_model(self.batch_size * 4)
-
-                        # Generate imaginary rollouts
-                        self.imaginary_rollout()
+                    if self.total_steps % self.model_train_freq == 0 and self.model_based:
+                        self.imaginary_rollout()  # Generate imaginary rollouts
 
                     # 4) Fourth chunk: train the SAC agent
-                    if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
-
+                    if self.total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
                         for _ in range(self.agent_steps):
-
                             final_buffer = self.get_final_buffer()
                             critic_loss, actor_loss, alpha_loss = self.sac_agent.update(final_buffer, self.batch_size)
+
+                # Break if episode is done or if the maximum number of steps is reached
+                if terminal or self.total_steps >= target_steps:
+                    break
+
+            episode += 1
 
             # 5) Logging and Printing
             if self.log_wandb:
                 wandb.log({
                     "Train/Episode Reward": episode_reward,
                     "Train/Episode Length": episode_steps,
-                    "Train/Global Step": total_steps,
+                    "Train/Global Step": self.total_steps,
                     "Train/Model Loss": model_loss if 'model_loss' in locals() else 0,
                     "Train/Critic Loss": critic_loss if 'critic_loss' in locals() else 0,
                     "Train/Actor Loss": actor_loss if 'actor_loss' in locals() else 0,
@@ -340,11 +477,56 @@ class MBPO_SAC:
                 print(f"Episode {episode}, Reward: {episode_reward:.2f}, Steps: {episode_steps}")
                 print("Model Loss: ", model_loss if 'model_loss' in locals() else 0)
 
+        # 6) Final logging
         wandb.finish()
 
     def save_agent(self, base_dir='trained_agents/'):
 
-        filename = base_dir + f"{self.alg_name}_seed_{self.seed}"
-
         # Save the entire SAC agent
+        filename = base_dir + f"{self.alg_name}_seed_{self.seed}"
         torch.save(self.sac_agent, filename)
+
+    @torch.no_grad()
+    def _evaluate_policy(self) -> float:
+
+        self.sac_agent.actor.eval()
+
+        avg_return = 0.0
+        for _ in range(self.eval_episodes):
+            if self.env_type == "gym_robotics":
+                s_dict, _ = self.env.reset()
+                state = flatten_obs(s_dict)
+            else:
+                state, _ = self.env.reset()
+
+            ep_ret = 0.0
+            for _ in range(1_000):  # Max steps in env
+                if self.total_steps > self.warmup_steps:
+                    action = self.sac_agent.select_action(state, deterministic=True).flatten()
+                else:
+                    action = self.env.action_space.sample()
+
+                if self.env_type == "gym_robotics":
+                    n_dict, r, d, t, _ = self.env.step(action)
+                    state = flatten_obs(n_dict)
+                else:
+                    state, r, d, t, _ = self.env.step(action)
+
+                ep_ret += r
+                if d or t:
+                    break
+
+            avg_return += ep_ret
+        avg_return /= self.eval_episodes
+
+        # restore the actor to training mode
+        self.sac_agent.actor.train()
+
+        # Log the average return
+        if self.log_wandb:
+            wandb.log({"Eval/Average Return": avg_return,
+                       "Eval/Global Step": self.total_steps})
+
+        print(f"Eval Average Return: {avg_return:.2f}")
+
+        return avg_return
