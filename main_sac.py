@@ -51,13 +51,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     # The next is a "model-based" flag, but it is not used in the code as it is always true
     parser.add_argument('--model_based',
                         type=str2bool,
-                        default=False,
+                        default=True,
                         help='Enable model-based policy optimization (MBPO). Set to False to disable.')
 
     # Logging and output
     parser.add_argument('--log_wandb',
                         action='store_true',
-                        default=True,
+                        default=False,
                         help='Enable Weights & Biases tracking.')
     parser.add_argument(
         '--save_dir',

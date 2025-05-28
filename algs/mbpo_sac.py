@@ -212,6 +212,7 @@ class MBPO_SAC:
 
         return float(np.mean(best_val))
 
+    @torch.no_grad()
     def imaginary_rollout(self):
         """
         Rolls out from real states using the learned model. The length of each rollout
@@ -252,8 +253,7 @@ class MBPO_SAC:
 
             # Normalize the inputs. Ensemble predictions: shape [ensemble_size, batch_size, next_state_dim+1]
             model_input = self.ensemble_model.input_normalizer.normalize(model_input)
-            with torch.no_grad():
-                mean_preds, logvar_preds = self.ensemble_model(model_input)
+            mean_preds, logvar_preds = self.ensemble_model(model_input)
             all_preds_mean, all_preds_logvar = torch.stack(mean_preds, dim=0), torch.stack(logvar_preds, dim=0)
 
             # Next state is sampled from the ensemble
@@ -341,23 +341,19 @@ class MBPO_SAC:
 
             # Concatenate the two batches
             final_batch = real_batch + imaginary_batch
-
-            # Put in the ReplayBuffer format
-            final_buffer = ReplayBuffer(self.update_size + 1)
-            final_buffer.buffer = final_batch
-            final_buffer.position = len(final_buffer.buffer)
+            s, a, r, ns, d = map(np.stack, zip(*final_batch))
 
         else:
 
             # Sample all the real buffer
             real_batch = random.sample(self.real_buffer.buffer, self.update_size)
+            s, a, r, ns, d = map(np.stack, zip(*real_batch))
 
-            # Put in the ReplayBuffer format
-            final_buffer = ReplayBuffer(self.update_size + 1)
-            final_buffer.buffer = real_batch
-            final_buffer.position = len(final_buffer.buffer)
-
-        return final_buffer
+        return torch.as_tensor(s, device=self.device, dtype=torch.float32), \
+            torch.as_tensor(a, device=self.device, dtype=torch.float32), \
+            torch.as_tensor(r, device=self.device, dtype=torch.float32).unsqueeze(-1), \
+            torch.as_tensor(ns, device=self.device, dtype=torch.float32), \
+            torch.as_tensor(d, device=self.device, dtype=torch.float32).unsqueeze(-1)
 
     def train(self, num_episodes=200, max_steps=1_000):
         if self.log_wandb:
@@ -452,8 +448,8 @@ class MBPO_SAC:
                     # 4) Fourth chunk: train the SAC agent
                     if self.total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
                         for _ in range(self.agent_steps):
-                            final_buffer = self.get_final_buffer()
-                            critic_loss, actor_loss, alpha_loss = self.sac_agent.update(final_buffer, self.batch_size)
+                            s, a, r, ns, d = self.get_final_buffer()
+                            critic_loss, actor_loss, alpha_loss = self.sac_agent.update(s, a, r, ns, d)
 
                 # Break if episode is done or if the maximum number of steps is reached
                 if terminal or self.total_steps >= target_steps:

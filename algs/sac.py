@@ -277,19 +277,7 @@ class SAC:
 
         return action.cpu().data.numpy()
 
-    def update(self, replay_buffer, batch_size):
-
-        # Define the batch size as the minimum of the batch size and the replay buffer length
-        batch_size = min(batch_size, len(replay_buffer))
-
-        # Sample a batch from memory
-        state, action, reward, next_state, done = replay_buffer.sample(batch_size)
-
-        state = torch.FloatTensor(state).to(self.device)
-        action = torch.FloatTensor(action).to(self.device)
-        reward = torch.FloatTensor(reward).to(self.device).unsqueeze(1)
-        next_state = torch.FloatTensor(next_state).to(self.device)
-        done = torch.FloatTensor(np.float32(done)).to(self.device).unsqueeze(1)
+    def update(self, state, action, reward, next_state, done):
 
         # Update Critic
         with torch.no_grad():

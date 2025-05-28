@@ -343,22 +343,21 @@ class CMBPO_SAC:
             # Concatenate the two batches
             final_batch = real_batch + imaginary_batch
 
-            # Put in the ReplayBuffer format
-            final_buffer = ReplayBuffer(self.update_size + 1)
-            final_buffer.buffer = final_batch
-            final_buffer.position = len(final_buffer.buffer)
+            # Concatenate the two batches
+            final_batch = real_batch + imaginary_batch
+            s, a, r, ns, d = map(np.stack, zip(*final_batch))
 
         else:
 
-            # Sample 5% of the real buffer
+            # Sample all the real buffer
             real_batch = random.sample(self.real_buffer.buffer, self.update_size)
+            s, a, r, ns, d = map(np.stack, zip(*real_batch))
 
-            # Put in the ReplayBuffer format
-            final_buffer = ReplayBuffer(self.update_size + 1)
-            final_buffer.buffer = real_batch
-            final_buffer.position = len(final_buffer.buffer)
-
-        return final_buffer
+        return torch.as_tensor(s, device=self.device, dtype=torch.float32), \
+            torch.as_tensor(a, device=self.device, dtype=torch.float32), \
+            torch.as_tensor(r, device=self.device, dtype=torch.float32).unsqueeze(-1), \
+            torch.as_tensor(ns, device=self.device, dtype=torch.float32), \
+            torch.as_tensor(d, device=self.device, dtype=torch.float32).unsqueeze(-1)
 
     def train(self, num_episodes=200, max_steps=1_000):
         if self.log_wandb:
@@ -437,9 +436,8 @@ class CMBPO_SAC:
                     if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
 
                         for _ in range(self.agent_steps):
-
-                            final_buffer = self.get_final_buffer()
-                            critic_loss, actor_loss, alpha_loss = self.sac_agent.update(final_buffer, self.batch_size)
+                            s, a, r, ns, d = self.get_final_buffer()
+                            critic_loss, actor_loss, alpha_loss = self.sac_agent.update(s, a, r, ns, d)
 
             # 4) Logging and Printing
             if self.log_wandb:
