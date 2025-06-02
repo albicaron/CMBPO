@@ -170,8 +170,7 @@ class FactorizedEnsembleModel(nn.Module):
           ensemble member k for that dimension d.
         """
 
-        means_all = []
-        logvars_all = []
+        means_all, logvars_all = [], []
 
         # dimension_models[d] => the ensemble for dimension d
         for d in range(self.dimensions):
@@ -180,9 +179,11 @@ class FactorizedEnsembleModel(nn.Module):
 
             for k, model_k in enumerate(self.dimensions_models[d]):
 
-                # Apply ensemble specific causal mask
+                # CRITICAL FIX: Apply ensemble-specific causal mask
+                causal_mask = self.ensemble_causal_masks[k, d]  # Shape: (state_dim + action_dim,)
+                x_masked = x * causal_mask.unsqueeze(0)  # Apply mask to inputs
 
-                pred = model_k(x)  # shape (batch, 2)
+                pred = model_k(x_masked)  # shape (batch, 2)
                 mean_k = pred[:, 0:1]  # shape (batch,1)
                 logvar_k = pred[:, 1:2]  # shape (batch,1)
 

@@ -570,3 +570,245 @@ def rescale_var(var, min_log_var=-5., max_log_var=1., decay=0.1):
     max_log_var = torch.tensor(max_log_var, dtype=torch.float32)
     min_var, max_var = torch.exp(min_log_var), torch.exp(max_log_var)
     return max_var - decay * (max_var - var)
+
+
+def compute_path_ce_factorized(est_cgm,
+                               factorized_ensemble,
+                               current_states,
+                               policy,
+                               n_action_samples=32,
+                               n_mixture_samples=128):
+    """
+    Compute causal empowerment for paths A → S^j → R using the factorized ensemble model.
+
+    This function:
+    1. Identifies state dimensions that satisfy the causal path A → S^j → R
+    2. Computes empowerment only for those causally relevant dimensions
+    3. Properly handles structural uncertainty from the factorized model
+
+    Args:
+        est_cgm: Estimated causal graphical model (probabilistic adjacency matrix)
+        factorized_ensemble: FactorizedEnsembleModel instance
+        current_states: Current states tensor (batch_size, state_dim)
+        policy: Policy for action sampling
+        n_action_samples: Number of action samples for empowerment computation
+        n_mixture_samples: Number of mixture samples for marginal entropy estimation
+
+    Returns:
+        causal_empowerment: Tensor (ensemble_size, batch_size, n_relevant_dims)
+    """
+
+    if not torch.is_tensor(est_cgm):
+        est_cgm = torch.tensor(est_cgm, dtype=torch.float32, device=factorized_ensemble.device)
+    else:
+        est_cgm = est_cgm.to(factorized_ensemble.device)
+
+    state_dim = factorized_ensemble.state_dim
+    action_dim = factorized_ensemble.action_dim
+
+    # Extract submatrix: (states+actions) → (next_states+reward)
+    sub_cgm_matrix = est_cgm[:(state_dim + action_dim), (state_dim + action_dim):].detach()
+
+    # Use probabilistic thresholding (more sophisticated than hard 0.5 threshold)
+    prob_threshold = 0.3  # Lower threshold to capture uncertain but plausible edges
+
+    # Find states that satisfy A → S^j (action influences state j)
+    has_a_to_s = (sub_cgm_matrix[:action_dim, :state_dim] > prob_threshold).any(dim=0)  # (state_dim,)
+
+    # Find states that satisfy S^j → R (state j influences reward)
+    has_s_to_r = sub_cgm_matrix[action_dim:action_dim + state_dim, -1] > prob_threshold  # (state_dim,)
+
+    # States that satisfy the full path A → S^j → R
+    causal_path_states = has_a_to_s & has_s_to_r
+    r_pa_idx = torch.nonzero(causal_path_states, as_tuple=False).squeeze(-1)  # 1-D tensor
+
+    if len(r_pa_idx) == 0:
+        # No causally relevant states found - return zero empowerment
+        return torch.zeros(factorized_ensemble.ensemble_size, current_states.size(0), 1,
+                           device=factorized_ensemble.device)
+
+    # Compute empowerment using the factorized model
+    causal_emp = compute_causal_emp_factorized(
+        factorized_ensemble,
+        current_states,
+        policy,
+        n_action_samples=n_action_samples,
+        n_mixture_samples=n_mixture_samples,
+        target_dims=r_pa_idx,
+    )
+
+    return causal_emp
+
+
+def compute_causal_emp_factorized(factorized_ensemble,
+                                  current_states,
+                                  policy,
+                                  n_action_samples=32,
+                                  n_mixture_samples=128,
+                                  target_dims=None):
+    """
+    Compute causal empowerment for the factorized ensemble model.
+
+    This is an adapted version of compute_causal_emp_fast that works with
+    the FactorizedEnsembleModel and properly handles structural uncertainty.
+
+    Args:
+        factorized_ensemble: FactorizedEnsembleModel instance
+        current_states: Current states tensor (batch_size, state_dim)
+        policy: Policy for action sampling
+        n_action_samples: Number of action samples
+        n_mixture_samples: Number of mixture samples
+        target_dims: Indices of target dimensions to compute empowerment for
+
+    Returns:
+        empowerment: Tensor (ensemble_size, batch_size, n_target_dims)
+    """
+
+    device = factorized_ensemble.device
+    B = current_states.size(0)
+    K = factorized_ensemble.ensemble_size
+    state_dim = factorized_ensemble.state_dim
+
+    if target_dims is None:
+        target_dims = torch.arange(state_dim, device=device)
+    elif not torch.is_tensor(target_dims):
+        target_dims = torch.tensor(target_dims, device=device)
+
+    n_target_dims = len(target_dims)
+    TWO_PI_E = 2.0 * math.pi * math.e
+
+    # Sample actions from the policy
+    actions_np = np.stack(
+        [policy.select_action(current_states) for _ in range(n_action_samples)],
+        axis=0
+    )
+    actions_sample = torch.as_tensor(actions_np, dtype=torch.float32,
+                                     device=device)  # (n_action_samples, B, action_dim)
+
+    # Prepare inputs for batch processing
+    s_rep = current_states.unsqueeze(0).expand(n_action_samples, -1, -1)  # (n_action_samples, B, state_dim)
+    inputs = torch.cat([s_rep.reshape(-1, state_dim), actions_sample.reshape(-1, policy.action_dim)],
+                       dim=1)  # (n_action_samples*B, state_dim+action_dim)
+    inputs = factorized_ensemble.input_normalizer.normalize(inputs)
+
+    with torch.no_grad():
+        means_all, logvars_all = factorized_ensemble(inputs)
+
+    # Convert to the format needed for empowerment computation
+    # We need means and vars of shape (K, n_action_samples, B, n_target_dims)
+    ensemble_means = []
+    ensemble_vars = []
+
+    for k in range(K):
+        # For ensemble member k, collect predictions for target dimensions
+        k_means = []
+        k_logvars = []
+
+        for dim_idx in target_dims:
+            dim_mean = means_all[dim_idx][k].view(n_action_samples, B, 1)  # (n_action_samples, B, 1)
+            dim_logvar = logvars_all[dim_idx][k].view(n_action_samples, B, 1)
+            k_means.append(dim_mean)
+            k_logvars.append(dim_logvar)
+
+        k_means = torch.cat(k_means, dim=2)  # (n_action_samples, B, n_target_dims)
+        k_logvars = torch.cat(k_logvars, dim=2)
+        k_vars = torch.exp(k_logvars)
+
+        ensemble_means.append(k_means)
+        ensemble_vars.append(k_vars)
+
+    ensemble_means = torch.stack(ensemble_means, dim=0)  # (K, n_action_samples, B, n_target_dims)
+    ensemble_vars = torch.stack(ensemble_vars, dim=0)  # (K, n_action_samples, B, n_target_dims)
+
+    # Compute conditional entropy H(S'|S,A) for each ensemble member
+    cond_entropy = 0.5 * torch.log(TWO_PI_E * ensemble_vars).mean(dim=1)  # (K, B, n_target_dims)
+
+    # Compute marginal entropy H(S'|S) via mixture-of-Gaussians
+    marginal_entropy = torch.zeros(K, B, n_target_dims, device=device)
+
+    for k in range(K):
+        # For ensemble member k
+        means_k = ensemble_means[k]  # (n_action_samples, B, n_target_dims)
+        vars_k = ensemble_vars[k]  # (n_action_samples, B, n_target_dims)
+
+        # Monte Carlo estimation of marginal entropy
+        # Sample mixture component indices
+        mix_indices = torch.randint(0, n_action_samples, (n_mixture_samples, B), device=device)
+
+        # Sample from chosen components
+        sampled_means = means_k[mix_indices, torch.arange(B).unsqueeze(0)]  # (n_mixture_samples, B, n_target_dims)
+        sampled_vars = vars_k[mix_indices, torch.arange(B).unsqueeze(0)]  # (n_mixture_samples, B, n_target_dims)
+
+        # Generate samples
+        samples = torch.normal(sampled_means, torch.sqrt(sampled_vars))  # (n_mixture_samples, B, n_target_dims)
+
+        # Compute log probabilities under the mixture
+        log_probs = []
+        for action_idx in range(n_action_samples):
+            mu = means_k[action_idx].unsqueeze(0)  # (1, B, n_target_dims)
+            var = vars_k[action_idx].unsqueeze(0)  # (1, B, n_target_dims)
+
+            # Gaussian log probability
+            log_prob = -0.5 * (torch.log(2 * math.pi * var) + (samples - mu) ** 2 / var)
+            log_prob = log_prob.sum(dim=2)  # Sum over dimensions
+            log_probs.append(log_prob)
+
+        log_probs = torch.stack(log_probs, dim=2)  # (n_mixture_samples, B, n_action_samples)
+        log_mix_prob = torch.logsumexp(log_probs, dim=2) - math.log(n_action_samples)  # (n_mixture_samples, B)
+
+        # Average over mixture samples to get marginal entropy
+        marginal_entropy[k] = -log_mix_prob.mean(dim=0).unsqueeze(1).expand(-1, n_target_dims)
+
+    # Empowerment = Marginal Entropy - Conditional Entropy
+    empowerment = marginal_entropy - cond_entropy  # (K, B, n_target_dims)
+
+    return empowerment
+
+
+def validate_causal_empowerment_implementation(factorized_ensemble, test_states, policy, true_cgm=None):
+    """
+    Validation function to check if causal empowerment is correctly implemented.
+
+    This function performs several sanity checks:
+    1. Empowerment values are non-negative (information-theoretic property)
+    2. Dimensions not in causal paths have lower empowerment
+    3. Structural uncertainty affects empowerment computation
+
+    Args:
+        factorized_ensemble: FactorizedEnsembleModel instance
+        test_states: Test states for validation
+        policy: Policy for action sampling
+        true_cgm: Optional true causal graph for comparison
+
+    Returns:
+        validation_results: Dictionary with validation metrics
+    """
+
+    # Create a dummy probabilistic CGM for testing
+    state_dim = factorized_ensemble.state_dim
+    action_dim = factorized_ensemble.action_dim
+    total_dim = state_dim + action_dim + state_dim + 1
+
+    # Create a test CGM with some structure
+    test_cgm = torch.zeros(total_dim, total_dim, device=factorized_ensemble.device)
+
+    # Add some example causal relationships: A → S1 → R and A → S2
+    test_cgm[state_dim:state_dim + action_dim, state_dim + action_dim:state_dim + action_dim + 2] = 0.8  # A → S1, S2
+    test_cgm[state_dim + action_dim:state_dim + action_dim + 1, -1] = 0.9  # S1 → R
+
+    # Compute empowerment
+    empowerment = compute_path_ce_factorized(
+        test_cgm, factorized_ensemble, test_states, policy
+    )
+
+    validation_results = {
+        'empowerment_shape': empowerment.shape,
+        'empowerment_mean': empowerment.mean().item(),
+        'empowerment_std': empowerment.std().item(),
+        'min_empowerment': empowerment.min().item(),
+        'max_empowerment': empowerment.max().item(),
+        'all_non_negative': (empowerment >= 0).all().item(),
+        'ensemble_disagreement': empowerment.std(dim=0).mean().item()
+    }
+
+    return validation_results

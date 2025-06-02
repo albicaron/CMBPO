@@ -4,7 +4,7 @@ import numpy as np
 
 from algs.sac import SAC, ReplayBuffer
 from dynamics.causal_models import StructureLearning, set_p_matrix
-from dynamics.utils import compute_jsd, compute_path_ce, linear_scheduler
+from dynamics.utils import compute_jsd, compute_path_ce, linear_scheduler, validate_causal_empowerment_implementation
 from dynamics.causal_dynamics_models import FactorizedEnsembleModel
 import matplotlib.pyplot as plt
 
@@ -136,17 +136,17 @@ class CMBPO_SAC:
 
         return model_loss
 
-
+    # TODO: HEREEEEEE
+    @torch.no_grad()
     def counterfact_rollout(self):
         """
-        Rolls out from real states using the learned model. The length of each rollout
-        is dynamically adjusted based on ensemble disagreement/uncertainty.
+        Rolls out from real states using the learned factorized model.
+        The length of each rollout is dynamically adjusted based on ensemble disagreement/uncertainty.
 
-        Idea:
-        - We keep rolling out up to 'self.max_rollout_len' steps.
-        - At each step, compute the standard deviation (or variance) across
-          the ensemble for the *next state*. If it exceeds some threshold,
-          we stop rolling out that particular state.
+        This version properly handles structural uncertainty by:
+        1. Converting factorized output to standard format for compatibility
+        2. Incorporating both parameter and structural uncertainty in JSD computation
+        3. Propagating uncertainty from both the probabilistic CGM and ensemble diversity
         """
 
         # Augment max_length_traj by 1 every 10_000 steps
@@ -172,21 +172,34 @@ class CMBPO_SAC:
             # Ensemble predictions: shape [ensemble_size, batch_size, next_state_dim+1]
             model_input = torch.cat([initial_states, actions], dim=1)
             model_input = self.ensemble_model.input_normalizer.normalize(model_input)
-            with torch.no_grad():
-                mean_preds, logvar_preds = self.ensemble_model(model_input)
-            all_preds_mean, all_preds_logvar = torch.stack(mean_preds, dim=0), torch.stack(logvar_preds, dim=0)
+            means_all, logvars_all = self.ensemble_model(model_input)
 
-            # Next state is sampled from the ensemble
+            # Convert factorized outputs to standard format
+            # means_all[d][k] -> all_preds_mean[k, batch, d]
+            all_preds_mean, all_preds_logvar = [], []
+
+            for k in range(self.ensemble_model.ensemble_size):
+                # Collect predictions from ensemble member k across all dimensions
+                pred_mean_k = torch.cat([means_all[d][k] for d in range(self.ensemble_model.dimensions)], dim=1)
+                pred_logvar_k = torch.cat([logvars_all[d][k] for d in range(self.ensemble_model.dimensions)], dim=1)
+                all_preds_mean.append(pred_mean_k)
+                all_preds_logvar.append(pred_logvar_k)
+
+            # Stack predictions to get shape [ensemble_size, batch_size, next_state_dim+1]
+            all_preds_mean = torch.stack(all_preds_mean, dim=0)  # [ensemble_size, num_samples, next_state_dim+1]
+            all_preds_logvar = torch.stack(all_preds_logvar, dim=0)  # [ensemble_size, num_samples, next_state_dim+1]
+
+            # Sample from the ensemble. The ensemble contains both parameter and structural uncertainty.
             head_idx = torch.randint(self.ensemble_model.ensemble_size, (num_samples,), device=self.device)
-            mean_pred = all_preds_mean[head_idx, torch.arange(num_samples)]
-            logvar_pred = all_preds_logvar[head_idx, torch.arange(num_samples)]
+            mean_preds = all_preds_mean[head_idx, torch.arange(num_samples)]
+            logvar_preds = all_preds_logvar[head_idx, torch.arange(num_samples)]
 
             # Add model noise
-            std_pred = torch.exp(0.5 * logvar_pred).clamp(max=0.25)  # σ ≤ 0.25 (normalised)
-            noise = torch.randn_like(mean_pred) * std_pred
-            mean_pred = mean_pred + noise
+            std_preds = torch.exp(0.5 * logvar_preds).clamp(max=0.25)  # σ ≤ 0.25 (normalised)
+            noise = torch.randn_like(mean_preds) * std_preds
+            mean_pred = mean_preds + noise
 
-            # Pick normalized rewards
+            # Extract reward predictions
             reward_pred = mean_pred[:, -1].clone().unsqueeze(1)
             reward_original = reward_pred.clone()  # For logging
 
@@ -204,16 +217,15 @@ class CMBPO_SAC:
 
             if self.causal_bonus:
 
-                # TODO: Check if causal empowerment for only parents of reward is correctly implemented
-                # causal_empow = compute_causal_emp(self.ensemble_model, current_states, self.sac_agent)
+                # Compute causal empowerment using the factorized model
+                # This automatically benefits from structural uncertainty propagation
                 causal_empow = compute_path_ce(self.est_cgm, self.ensemble_model, initial_states, self.sac_agent)
-                causal_empow_bonus = causal_empow.mean(dim=0)  # shape: (n_batch, sts_dim)
-                std_causal_empow_bonus = causal_empow.std(dim=0)  # shape: (n_batch, sts_dim)
+                causal_empow_bonus = causal_empow.mean(dim=0)  # shape: (n_batch, n_relevant_dims)
+                std_causal_empow_bonus = causal_empow.std(dim=0)  # shape: (n_batch, n_relevant_dims)
 
                 # Scale CE by running std of the reward channel for numerical stability
                 reward_std = self.ensemble_model.output_normalizer.var[-1].detach().clamp_min(1e-6).sqrt()
                 de_meaned_ce = causal_empow_bonus - causal_empow_bonus.mean(dim=0)
-
                 norm_ce = (de_meaned_ce.sum(dim=1, keepdim=True) / (reward_std + 1e-6))
 
                 causal_bonus_tot = self.causal_eta * norm_ce
@@ -287,11 +299,37 @@ class CMBPO_SAC:
             uncertainty_method=self.uncer_cgm_model
         )
 
+        # Validate the implementation (optional but recommended)
+        validation_results = self.validate_causal_implementation()
+
         # Plot DAG at the end of the training
         if self.log_wandb and len(self.real_buffer) % (self.cgm_train_freq + 1) == 0:
             fig = self.local_cgm.plot_dag(self.est_cgm, self.true_cgm)
             wandb.log({"Train/Estimated CGM": wandb.Image(fig)})
             plt.close(fig)
+
+    def validate_causal_implementation(self):
+        """
+        Validate that the causal empowerment implementation is working correctly.
+        Call this after CGM updates to ensure everything is functioning properly.
+        """
+        if len(self.real_buffer) < 1000:  # Need enough data for meaningful validation
+            return {}
+
+        # Sample some states for validation
+        states, _, _, _, _ = self.real_buffer.sample(min(100, len(self.real_buffer)))
+        test_states = torch.FloatTensor(states).to(self.device)
+
+        # Run validation
+        from dynamics.utils import validate_causal_empowerment_implementation
+        validation_results = validate_causal_empowerment_implementation(
+            self.ensemble_model, test_states, self.sac_agent
+        )
+
+        if self.log_wandb:
+            wandb.log({f"Validation/{k}": v for k, v in validation_results.items()})
+
+        return validation_results
 
     def get_final_buffer(self, proportion_real=0.05):
 
