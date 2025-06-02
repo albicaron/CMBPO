@@ -4,9 +4,11 @@ import numpy as np
 
 from algs.sac import SAC, ReplayBuffer
 from dynamics.causal_models import StructureLearning, set_p_matrix
-from dynamics.utils import compute_jsd, compute_path_ce
+from dynamics.utils import compute_jsd, compute_path_ce, linear_scheduler
 from dynamics.dynamics_models import EnsembleModel
 import matplotlib.pyplot as plt
+
+import gymnasium as gym
 
 import wandb
 import time
@@ -31,25 +33,48 @@ def set_device():
 
 
 class CMBPO_SAC:
-    def __init__(self, env, seed, dev, log_wandb=True, model_based=False,
-                 steps_per_epoch=1_000,
-                 sl_method="PC", bootstrap='standard', n_bootstrap=5, cgm_train_freq=5_000,
-                 causal_bonus=True, causal_eta=0.01, var_causal_bonus=False, var_causal_eta=0.001,
-                 jsd_bonus=False, jsd_eta=0.01, jsd_thres=1.0,
-                 lr_model=1e-3,
-                 lr_sac=0.0003, agent_steps=20, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=1,
-                 rollout_per_step=400,  # Maybe put 100_000 as it is batched anyway
-                 update_size=256, sac_train_freq=1, model_train_freq=250, batch_size=256):
+    def __init__(self,
+                 env: gym.Env,
+                 seed: int = 0,
+                 dev: torch.device = None,
+                 log_wandb: bool = False,
+                 model_based: bool = True,
+                 sl_method: str = 'PC',
+                 bootstrap: str = 'standard',
+                 n_bootstrap: int = 10,
+                 cgm_train_freq: int = 5_000,
+                 warmup_steps: int = 1_000,
+                 eval_freq: int = 1_000,
+                 causal_bonus: bool = True,
+                 causal_eta: float = 0.01,
+                 var_causal_bonus: bool = False,
+                 var_causal_eta: float = 0.001,
+                 jsd_bonus: float = False,
+                 jsd_eta: float = 0.01,
+                 jsd_thres: float = 1.0,
+                 lr_model: float = 1e-3,
+                 lr_sac: float = 0.0003,
+                 agent_steps: int = 20,
+                 gamma: float = 0.99,
+                 tau: float = 0.005,
+                 alpha: float = 0.2,
+                 max_rollout_len: int = 1,
+                 rollout_schedule: list = None,  # Schedule rollout length - for Half-Cheetah = [20_000, 100_000, 1, 15]
+                 rollout_per_step: int = 400,  # Maybe put 100_000 as it is batched anyway
+                 update_size: int = 256,
+                 sac_train_freq: int = 1,
+                 model_train_freq: int = 250,
+                 batch_size: int = 256):
 
         self.env = env
         self.seed = seed
+        self.device = dev
         self.log_wandb = log_wandb
         self.model_based = model_based
         if model_based:
             self.alg_name = f"CMBPO_SAC_{sl_method}_boot{str(bootstrap)}_ce{str(causal_bonus)}_varce{str(var_causal_bonus)}"
         else:
             self.alg_name = f"C_SAC_{sl_method}_boot{str(bootstrap)}_ce{str(causal_bonus)}_varce{str(var_causal_bonus)}"
-
 
         self.state_dim = env.observation_space.shape[0]
         self.action_dim = env.action_space.shape[0]
@@ -64,22 +89,22 @@ class CMBPO_SAC:
         self.update_size = update_size  # Size of the final buffer to train the SAC agent made of %5-95% real-imaginary
 
         # The agent steps are 1 for SAC and agent_steps for MBPO
+        self.total_steps, self.max_steps = 0, 0
+        self.warmup_steps, self.eval_freq = warmup_steps, eval_freq
         self.agent_steps = agent_steps if self.model_based else 1
         self.sac_train_freq = sac_train_freq
         self.model_train_freq = model_train_freq
-
         self.batch_size = batch_size
-
-        self.device = dev
 
         self.sac_agent = SAC(self.state_dim, self.action_dim, self.max_action, lr=lr_sac, gamma=gamma,
                              tau=tau, alpha=alpha, device=self.device)
 
+        # TODO: Use Factored Dynamics Model instead of EnsembleModel (modelling every f_j)
         self.ensemble_model = EnsembleModel(state_dim=self.state_dim, action_dim=self.action_dim, lr=lr_model,
-                                            device=self.device, ensemble_size=5).to(self.device)
-
+                                            device=self.device, ensemble_size=7).to(self.device)
+        self.rollout_schedule = rollout_schedule
         self.real_buffer = ReplayBuffer(int(1_000_000))
-        self.imaginary_buffer = ReplayBuffer(int(rollout_per_step * steps_per_epoch))  # 1_000 * 400 = 400_000
+        self.imaginary_buffer = ReplayBuffer(int(1_000_000))
 
         self.jsd_thres, self.jsd_bonus, self.jsd_eta = jsd_thres, jsd_bonus, jsd_eta
 
@@ -104,6 +129,7 @@ class CMBPO_SAC:
         self.causal_bonus, self.causal_eta = causal_bonus, causal_eta
         self.var_causal_bonus, self.var_causal_eta = var_causal_bonus, var_causal_eta
 
+    # TODO: Change for Factored Dynamics Model
     def update_model(self, batch_size=256, epochs=100):
 
         if len(self.real_buffer) < 50_000:
@@ -161,28 +187,14 @@ class CMBPO_SAC:
         """
 
         # Augment max_length_traj by 1 every 10_000 steps
-        add_on = 0
-        if len(self.real_buffer) > 200_000:
-            add_on = int(len(self.real_buffer) / 200_000)
-
-        max_length_traj = self.max_rollout_len + add_on
-
-        # Number of rollouts to generate from the real buffer
-        num_samples = self.num_model_rollouts           # always 100_000
-
+        max_length_traj = linear_scheduler(self.rollout_schedule, self.total_steps)
+        num_samples = int(self.num_model_rollouts // max_length_traj)  # keeps the seed fixed to the number of rollouts
         initial_states, _, _, _, _ = self.real_buffer.sample(num_samples, replace=True)
         initial_states = torch.FloatTensor(initial_states).to(self.device)
 
-        # Whether we should continue for each sample in the batch
         # "active_mask[i] = False" => stop rolling out sample i
         active_mask = torch.ones(num_samples, dtype=torch.bool, device=self.device)
-
-        # Let us define a hyperparameter or heuristic threshold for "too high" variance
-        # In practice, you can tune this threshold or make it adapt over time.
-        jsd_threshold = 1.0  # or any other measure you want
-
-        # # Sample an ensemble index for each sample in the batch, to use consistent ensemble members for each rollout
-        # ensemble_idx = torch.randint(self.ensemble_model.ensemble_size, (num_samples,))
+        jsd_threshold = 1.0  # JSD threshold for uncertainty (0.5 is too low, 1.0 is more reasonable)
 
         for t in range(max_length_traj):
 
@@ -193,10 +205,9 @@ class CMBPO_SAC:
             actions = self.sac_agent.select_action(initial_states)
             actions = torch.FloatTensor(actions).to(self.device)
 
-            model_input = torch.cat([initial_states, actions], dim=1)
-
+            # TODO: Change for Factored Dynamics Model
             # Ensemble predictions: shape [ensemble_size, batch_size, next_state_dim+1]
-            # Normalize the inputs
+            model_input = torch.cat([initial_states, actions], dim=1)
             model_input = self.ensemble_model.input_normalizer.normalize(model_input)
             with torch.no_grad():
                 mean_preds, logvar_preds = self.ensemble_model(model_input)
@@ -219,7 +230,7 @@ class CMBPO_SAC:
             # Compute uncertainty as disagreement across ensemble (JSD) - can use it also as intrinsic reward
             ns_jsd = compute_jsd(all_preds_mean, torch.exp(all_preds_logvar))
 
-            # REWARDS AUGMENTATION
+            # REWARDS AUGMENTATION EXPLORATION AND CAUSAL EMPOWERMENT
             if self.jsd_bonus:
 
                 # Scale JSD by running std of the reward channel for numerical stability
@@ -254,17 +265,14 @@ class CMBPO_SAC:
 
             # Denormalize the outputs
             denorm_mean_pred = self.ensemble_model.output_normalizer.denormalize(mean_pred)
-
             delta_next_state = denorm_mean_pred[:, :-1]
             next_states = initial_states + delta_next_state
 
             rewards = denorm_mean_pred[:, -1].unsqueeze(1)
             dones = torch.zeros_like(rewards)
 
-            # Compute the mask
+            # Compute the mask and update for samples that are still active but exceed the threshold
             push_mask = active_mask & (ns_jsd <= jsd_threshold)
-
-            # Update active_mask for samples that are still active but exceed the threshold
             active_mask[active_mask & (ns_jsd > jsd_threshold)] = False
 
             # Check if any sample should be pushed in this rollout step
@@ -288,7 +296,6 @@ class CMBPO_SAC:
                 )
 
             initial_states = next_states.detach()
-
         # End of imaginary rollouts
 
         # If wandb is enabled, log the normal rewards and causal rewards
@@ -307,10 +314,9 @@ class CMBPO_SAC:
         reward = reward.reshape(-1, 1)
 
         data_cgm = np.concatenate([state, action, next_state, reward], axis=1)
-        num_boots = self.n_bootstrap * 2 if len(self.real_buffer) < 10_000 else self.n_bootstrap
         self.est_cgm = self.local_cgm.learn_dag(data_cgm,
                                                 prior_knowledge=self.pk,
-                                                n_bootstrap=num_boots)
+                                                n_bootstrap=self.n_bootstrap)
 
         # # Set parents of (s, a) to (ns, r) to -1
         # self.ensemble_model.set_parents_from_prob_matrix(self.est_cgm)
@@ -323,13 +329,6 @@ class CMBPO_SAC:
 
     def get_final_buffer(self, proportion_real=0.05):
 
-        if len(self.real_buffer) < 10_000:
-            proportion_real = 0.5
-        # elif len(self.real_buffer) < 40_000:
-        #     proportion_real = 0.3  # 70 % synthetic
-        else:
-            proportion_real = 0.05
-
         # Function that creates a new ReplayBuffer with the data from the real buffer and imaginary buffer.
         if self.model_based:
 
@@ -339,9 +338,6 @@ class CMBPO_SAC:
             # Sample 95% of the imaginary buffer
             imaginary_size = min(int((1 - proportion_real) * self.update_size), len(self.imaginary_buffer))
             imaginary_batch = random.sample(self.imaginary_buffer.buffer, imaginary_size)
-
-            # Concatenate the two batches
-            final_batch = real_batch + imaginary_batch
 
             # Concatenate the two batches
             final_batch = real_batch + imaginary_batch
@@ -366,16 +362,18 @@ class CMBPO_SAC:
                        name=f"{self.alg_name}_SAC_seed_{self.seed}_time_{time.time()}",
                        config=self.__dict__, group=self.alg_name, dir='/tmp')
 
-        total_steps = 0
-        for episode in range(num_episodes):
+        episode = 0
+        self.max_steps = max_steps
+        target_steps = num_episodes * max_steps
+
+        while self.total_steps < target_steps:
             state, _ = self.env.reset()
-            episode_reward = 0
-            episode_steps = 0
+            episode_reward, episode_steps = 0, 0
 
             # 1) First chunk: roll an episode within the real environment and populate the real buffer
             for step in range(max_steps):
 
-                if total_steps > 5_000:
+                if self.total_steps > self.warmup_steps:
                     action = self.sac_agent.select_action(state).flatten()
                 else:
                     action = self.env.action_space.sample()
@@ -385,17 +383,18 @@ class CMBPO_SAC:
 
                 self.real_buffer.push(state, action, reward, next_state, terminal)
 
+                # Set state to next_state and increment the episode reward and steps
+                state = next_state
                 episode_reward += reward
                 episode_steps += 1
-                total_steps += 1
+                self.total_steps += 1
 
-                state = next_state
+                # 2) Every self.eval_freq steps, evaluate the policy on deterministic actions
+                if self.total_steps % self.eval_freq == 0 and self.total_steps > 0:
+                    self._evaluate_policy()
 
-                if terminal:
-                    break
-
-                # 2) Update normalizers every self.model_train_freq steps in model-based training
-                if total_steps % self.model_train_freq == 0 and self.model_based:
+                # 3) Update normalizers every self.model_train_freq steps in model-based training
+                if self.total_steps % self.model_train_freq == 0 and self.model_based:
 
                     batch = self.real_buffer.buffer[-self.model_train_freq:]
                     states, actions, rewards, next_states, dones = map(np.stack, zip(*batch))
@@ -416,35 +415,35 @@ class CMBPO_SAC:
                     self.ensemble_model.input_normalizer.update(model_inputs)
                     self.ensemble_model.output_normalizer.update(targets)
 
+                    # Train the model
+                    if len(self.real_buffer) > (self.batch_size):
+                        # Train the model
+                        model_loss = self.update_model(self.batch_size)
+
                 # All this after the warm-up period of 5_000 steps used to populate the real buffer
-                if total_steps >= 5_000:
+                if self.total_steps >= self.warmup_steps:
 
-                    # 3) Third chunk: train the dynamics model and populate the imaginary buffer if self.model_based
-                    if total_steps % self.model_train_freq == 0 and len(self.real_buffer) > self.batch_size and self.model_based:
-
-                        model_loss = self.update_model(self.batch_size * 4)
-                        self.counterfact_rollout()
+                    # 3) Train the dynamics model and populate the imaginary buffer if self.model_based
+                    if self.total_steps % self.model_train_freq == 0 and self.model_based:
+                        self.counterfact_rollout()  # Generate imaginary rollouts
 
                     # 4) Learn Local Causal Graphical Model from the real buffer
-                    if total_steps % (self.cgm_train_freq + 1) == 0 and self.model_based:
+                    if self.total_steps % (self.cgm_train_freq + 1) == 0 and self.model_based:
                     # if total_steps == (self.cgm_train_freq + 1) and self.model_based and self.causal_bonus:
-
-                        # Learn the CGM with the last self.cgm_train_freq samples
                         self.update_cgm()
 
-                    # 5) Fifth chunk: train the SAC agent
-                    if total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
-
+                    # 5) Train the SAC agent
+                    if self.total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
                         for _ in range(self.agent_steps):
                             s, a, r, ns, d = self.get_final_buffer()
                             critic_loss, actor_loss, alpha_loss = self.sac_agent.update(s, a, r, ns, d)
 
-            # 4) Logging and Printing
+            # 6) Logging and Printing
             if self.log_wandb:
                 wandb.log({
                     "Train/Episode Reward": episode_reward,
                     "Train/Episode Length": episode_steps,
-                    "Train/Global Step": total_steps,
+                    "Train/Global Step": self.total_steps,
                     "Train/Model Loss": model_loss if 'model_loss' in locals() else 0,
                     "Train/Critic Loss": critic_loss if 'critic_loss' in locals() else 0,
                     "Train/Actor Loss": actor_loss if 'actor_loss' in locals() else 0,
@@ -459,8 +458,42 @@ class CMBPO_SAC:
 
     def save_agent(self, base_dir='trained_agents/'):
 
+        # Save the entire SAC agent for later use
         filename = base_dir + f"{self.alg_name}_seed_{self.seed}"
-
-        # Save the entire SAC agent
         torch.save(self.sac_agent, filename)
 
+    @torch.no_grad()
+    def _evaluate_policy(self, eval_episodes: int = 10) -> float:
+
+        self.sac_agent.actor.eval()
+
+        avg_return = 0.0
+        for _ in range(10):  # Eval episodes
+
+            state, _ = self.env.reset()
+            ep_ret = 0.0
+            for _ in range(self.max_steps):  # Max steps per episode
+                if self.total_steps > self.warmup_steps:
+                    action = self.sac_agent.select_action(state, deterministic=True).flatten()
+                else:
+                    action = self.env.action_space.sample()
+
+                state, r, d, t, _ = self.env.step(action)
+
+                ep_ret += r
+                if d or t:
+                    break
+
+            avg_return += ep_ret
+        avg_return /= eval_episodes
+
+        # restore the actor to training mode
+        self.sac_agent.actor.train()
+
+        # Log the average return
+        if self.log_wandb:
+            wandb.log({"Eval/Average Return": avg_return,
+                       "Eval/Global Step": self.total_steps})
+        print(f"Eval Average Return: {avg_return:.2f}")
+
+        return avg_return

@@ -6,6 +6,7 @@ from algs.sac import SAC, ReplayBuffer, HERReplayBuffer
 from dynamics.utils import compute_jsd, linear_scheduler, flatten_obs
 from dynamics.dynamics_models import EnsembleModel, mbpo_nll
 
+import gymnasium as gym
 from gymnasium.spaces import Dict
 
 import wandb
@@ -26,31 +27,40 @@ def set_device():
 
 
 class MBPO_SAC:
-    def __init__(self, env, seed, dev, log_wandb=True, model_based=False, lr_model=1e-3,
-                 lr_sac=0.0003, agent_steps=40, gamma=0.99, tau=0.005, alpha=0.2, max_rollout_len=1,
-                 rollout_schedule=None, rollout_per_step=400, update_size=256, sac_train_freq=1, model_train_freq=250,
-                 batch_size=256, eval_freq=1_000, eval_episodes=10):
-
-        if rollout_schedule is None:
-            self.rollout_schedule = [20_000, 100_000, 1, 15]  # ← change
-        else:
-            self.rollout_schedule = rollout_schedule
-
-        self.eval_freq = eval_freq
-        self.eval_episodes = eval_episodes
+    def __init__(self,
+                 env: gym.Env,
+                 seed: int = 0,
+                 dev: torch.device = None,
+                 log_wandb: bool = False,
+                 model_based: bool = True,
+                 lr_model: float = 1e-3,
+                 lr_sac: float = 3e-4,
+                 agent_steps: int = 40,  # Number of MBPO agent steps per training step (if SAC agent_steps=1)
+                 gamma: float = 0.99,
+                 tau: float = 0.005,
+                 alpha: float = 0.2,
+                 max_rollout_len: int = 1,  # Max length of the rollout in steps
+                 rollout_schedule: list = None,  # Schedule rollout length - for Half-Cheetah = [20_000, 100_000, 1, 15]
+                 rollout_per_step: float = 400,  # Number of rollouts per training step
+                 update_size: int = 256,  # Size of the final buffer to train the SAC agent made of 5%-95%
+                 sac_train_freq: int = 1,  # Frequency of SAC agent training steps
+                 model_train_freq: int = 250,  # Frequency of model training steps
+                 batch_size: int = 256,
+                 eval_freq: int = 1_000,  # Frequency of policy evaluation
+                 ):
 
         self.env = env
         self.seed = seed
+        self.device = dev
         self.log_wandb = log_wandb
         self.model_based = model_based
         self.alg_name = 'MBPO_SAC' if self.model_based else 'SAC'
+        self.eval_freq = eval_freq
 
         if isinstance(env.observation_space, Dict):
             self.env_type = "gym_robotics"
-            self.state_dim = (
-                    env.observation_space["observation"].shape[0] +
-                    env.observation_space["desired_goal"].shape[0]
-            )
+            self.state_dim = (env.observation_space["observation"].shape[0] +
+                              env.observation_space["desired_goal"].shape[0])
             self.warmup_steps = 500
         else:
             self.env_type = "gym_mujoco"
@@ -69,19 +79,17 @@ class MBPO_SAC:
         self.update_size = update_size  # Size of the final buffer to train the SAC agent made of %5-95% real-imaginary
 
         # The agent steps are 1 for SAC and agent_steps for MBPO
-        self.total_steps = 0
+        self.total_steps, self.max_steps = 0, 0
         self.agent_steps = agent_steps if self.model_based else 1
         self.sac_train_freq = sac_train_freq
         self.model_train_freq = model_train_freq
-
         self.batch_size = batch_size
-
-        self.device = dev
 
         self.sac_agent = SAC(self.state_dim, self.action_dim, self.max_action, lr=lr_sac, gamma=gamma,
                              tau=tau, alpha=alpha, device=self.device)
         self.ensemble_model = EnsembleModel(state_dim=self.state_dim, action_dim=self.action_dim, lr=lr_model,
                                             device=self.device, ensemble_size=7).to(self.device)
+        self.rollout_schedule = rollout_schedule
         self.elite_size = 5
         self.elite_idxs = list(range(self.elite_size))   # fallback before the first update
 
@@ -184,7 +192,6 @@ class MBPO_SAC:
 
                 improved = False
                 for i, (m, lv) in enumerate(zip(v_mean, v_logvar)):
-                    # vloss = F.gaussian_nll_loss(m, val_tg, torch.exp(lv), reduction='mean').item()
                     vloss = mbpo_nll(pred_mean=m, pred_logvar=lv, target=val_tg).item()
 
                     # relative improvement > 1%  (works even at first pass)
@@ -227,18 +234,13 @@ class MBPO_SAC:
 
          # Augment max_length_traj by 1 every 10_000 steps
         max_length_traj = linear_scheduler(self.rollout_schedule, self.total_steps)
-
-        # Number of rollouts to generate from the real buffer
         num_samples = int(self.num_model_rollouts // max_length_traj)  # keeps the seed fixed to the number of rollouts
-
         initial_states, _, _, _, _ = self.real_buffer.sample(num_samples, replace=True)
         initial_states = torch.FloatTensor(initial_states).to(self.device)
 
         # "active_mask[i] = False" => stop rolling out sample i
         active_mask = torch.ones(num_samples, dtype=torch.bool, device=self.device)
-
-        # JSD threshold for stopping the rollout
-        jsd_threshold = 1.0  # or any other measure you want
+        jsd_threshold = 1.0  # JSD threshold for uncertainty (0.5 is too low, 1.0 is more reasonable)
 
         for t in range(max_length_traj):
 
@@ -249,32 +251,27 @@ class MBPO_SAC:
             actions = self.sac_agent.select_action(initial_states)
             actions = torch.FloatTensor(actions).to(self.device)
 
-            model_input = torch.cat([initial_states, actions], dim=1)
-
             # Normalize the inputs. Ensemble predictions: shape [ensemble_size, batch_size, next_state_dim+1]
+            model_input = torch.cat([initial_states, actions], dim=1)
             model_input = self.ensemble_model.input_normalizer.normalize(model_input)
             mean_preds, logvar_preds = self.ensemble_model(model_input)
             all_preds_mean, all_preds_logvar = torch.stack(mean_preds, dim=0), torch.stack(logvar_preds, dim=0)
 
-            # Next state is sampled from the ensemble
-            # head_idx = torch.randint(self.ensemble_model.ensemble_size, (num_samples,), device=self.device)
+            # Next state is sampled from the ensemble (only top elite models)
             elite_tensor = torch.tensor(self.elite_idxs, device=self.device)
-            # safety: if elites not set yet, fall back to all heads
             if len(elite_tensor) == 0:
                 elite_tensor = torch.arange(self.ensemble_model.ensemble_size, device=self.device)
             head_idx = elite_tensor[torch.randint(len(elite_tensor), (num_samples,), device=self.device)]
             mean_pred = all_preds_mean[head_idx, torch.arange(num_samples)]
             logvar_pred = all_preds_logvar[head_idx, torch.arange(num_samples)]
 
-            # Add model noise
-            # std_pred = torch.exp(0.5 * logvar_pred).clamp(max=0.25)  # σ ≤ 0.25 (normalised)
-            std_pred = torch.exp(0.5 * logvar_pred).clamp(max=0.5)  # σ ≤ 0.5 (normalised)
+            # Add model noise to the sampled mean predictions
+            std_pred = torch.exp(0.5 * logvar_pred).clamp(max=0.25)  # σ ≤ 0.5 (normalised)
             noise = torch.randn_like(mean_pred) * std_pred
             mean_pred = mean_pred + noise
 
             # De-normalize the outputs
             denorm_mean_pred = self.ensemble_model.output_normalizer.denormalize(mean_pred)
-
             delta_next_state = denorm_mean_pred[:, :-1]
             next_states = initial_states + delta_next_state  # Add delta to the current state
 
@@ -284,10 +281,8 @@ class MBPO_SAC:
             # Compute uncertainty as disagreement across ensemble (JSD)
             ns_jsd = compute_jsd(all_preds_mean, torch.exp(all_preds_logvar))
 
-            # Compute the mask
+            # Compute the mask and update for samples that are still active but exceed the threshold
             push_mask = active_mask & (ns_jsd <= jsd_threshold)
-
-            # Update active_mask for samples that are still active but exceed the threshold
             active_mask[active_mask & (ns_jsd > jsd_threshold)] = False
 
             # Check if any sample should be pushed in this rollout step
@@ -311,7 +306,6 @@ class MBPO_SAC:
                 )
 
             initial_states = next_states.detach()
-
         # End of imaginary rollouts
 
     def get_final_buffer(self, proportion_real=0.05):
@@ -323,7 +317,6 @@ class MBPO_SAC:
             else:
                 proportion_real = 0.05
         else:
-            # For Gym-Robotics
             if len(self.real_buffer) < self.warmup_steps:
                 proportion_real = 0.5
             else:
@@ -331,7 +324,6 @@ class MBPO_SAC:
 
         # Function that creates a new ReplayBuffer with the data from the real buffer and imaginary buffer.
         if self.model_based:
-
             # Sample 5% of the real buffer
             real_batch = random.sample(self.real_buffer.buffer, int(proportion_real * self.update_size))
 
@@ -344,7 +336,6 @@ class MBPO_SAC:
             s, a, r, ns, d = map(np.stack, zip(*final_batch))
 
         else:
-
             # Sample all the real buffer
             real_batch = random.sample(self.real_buffer.buffer, self.update_size)
             s, a, r, ns, d = map(np.stack, zip(*real_batch))
@@ -355,7 +346,7 @@ class MBPO_SAC:
             torch.as_tensor(ns, device=self.device, dtype=torch.float32), \
             torch.as_tensor(d, device=self.device, dtype=torch.float32).unsqueeze(-1)
 
-    def train(self, num_episodes=200, max_steps=1_000):
+    def train(self, num_episodes: int = 200, max_steps: int = 1_000):
         if self.log_wandb:
             project_name = self.env.unwrapped.spec.id if self.env.unwrapped.spec != None else 'SimpleCausal_Multi'
             wandb.init(project=project_name, sync_tensorboard=False,
@@ -363,6 +354,7 @@ class MBPO_SAC:
                        config=self.__dict__, group=self.alg_name, dir='/tmp')
 
         episode = 0
+        self.max_steps = max_steps
         target_steps = num_episodes * max_steps
 
         while self.total_steps < target_steps:
@@ -373,8 +365,7 @@ class MBPO_SAC:
             else:
                 state, _ = self.env.reset()
 
-            episode_reward = 0
-            episode_steps = 0
+            episode_reward, episode_steps = 0, 0
 
             # 1) First chunk: roll an episode with the real environment and populate the real buffer
             for step in range(max_steps):
@@ -411,7 +402,7 @@ class MBPO_SAC:
                 if self.total_steps % self.eval_freq == 0 and self.total_steps > 0:
                     self._evaluate_policy()
 
-                # 2) Update normalizers every self.model_train_freq steps in model-based training
+                # 3) Update normalizers every self.model_train_freq steps in model-based training
                 if self.total_steps % self.model_train_freq == 0 and self.model_based:
 
                     batch = self.real_buffer.buffer[-self.model_train_freq:]
@@ -441,11 +432,11 @@ class MBPO_SAC:
                 # All this after the warm-up period of warmup_steps steps used to populate the real buffer
                 if self.total_steps >= self.warmup_steps:
 
-                    # 3) Third chunk: train the dynamics model
+                    # 4) Train the dynamics model
                     if self.total_steps % self.model_train_freq == 0 and self.model_based:
                         self.imaginary_rollout()  # Generate imaginary rollouts
 
-                    # 4) Fourth chunk: train the SAC agent
+                    # 5) Train the SAC agent
                     if self.total_steps % self.sac_train_freq == 0 and len(self.real_buffer) > self.batch_size:
                         for _ in range(self.agent_steps):
                             s, a, r, ns, d = self.get_final_buffer()
@@ -457,7 +448,7 @@ class MBPO_SAC:
 
             episode += 1
 
-            # 5) Logging and Printing
+            # 6) Logging and Printing
             if self.log_wandb:
                 wandb.log({
                     "Train/Episode Reward": episode_reward,
@@ -473,22 +464,21 @@ class MBPO_SAC:
                 print(f"Episode {episode}, Reward: {episode_reward:.2f}, Steps: {episode_steps}")
                 print("Model Loss: ", model_loss if 'model_loss' in locals() else 0)
 
-        # 6) Final logging
-        wandb.finish()
+        wandb.finish()  # close the wandb run
 
-    def save_agent(self, base_dir='trained_agents/'):
+    def save_agent(self, base_dir: str = 'trained_agents/'):
 
         # Save the entire SAC agent
         filename = base_dir + f"{self.alg_name}_seed_{self.seed}"
         torch.save(self.sac_agent, filename)
 
     @torch.no_grad()
-    def _evaluate_policy(self) -> float:
+    def _evaluate_policy(self, eval_episodes: int = 10) -> float:
 
         self.sac_agent.actor.eval()
 
         avg_return = 0.0
-        for _ in range(self.eval_episodes):
+        for _ in range(eval_episodes):
             if self.env_type == "gym_robotics":
                 s_dict, _ = self.env.reset()
                 state = flatten_obs(s_dict)
@@ -496,7 +486,7 @@ class MBPO_SAC:
                 state, _ = self.env.reset()
 
             ep_ret = 0.0
-            for _ in range(1_000):  # Max steps in env
+            for _ in range(self.max_steps):
                 if self.total_steps > self.warmup_steps:
                     action = self.sac_agent.select_action(state, deterministic=True).flatten()
                 else:
@@ -513,7 +503,7 @@ class MBPO_SAC:
                     break
 
             avg_return += ep_ret
-        avg_return /= self.eval_episodes
+        avg_return /= eval_episodes
 
         # restore the actor to training mode
         self.sac_agent.actor.train()
@@ -522,7 +512,6 @@ class MBPO_SAC:
         if self.log_wandb:
             wandb.log({"Eval/Average Return": avg_return,
                        "Eval/Global Step": self.total_steps})
-
         print(f"Eval Average Return: {avg_return:.2f}")
 
         return avg_return

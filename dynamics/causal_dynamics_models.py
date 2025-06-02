@@ -43,7 +43,7 @@ class FactorizedEnsembleModel(nn.Module):
     for each dimension. This factorization ensures each dimension can see only
     the inputs we decide, if we like.
     """
-    def __init__(self, state_dim, action_dim, device, hidden_units=200, ensemble_size=10, lr=0.001):
+    def __init__(self, state_dim, action_dim, device, hidden_units=128, ensemble_size=10, lr=0.001):
         super(FactorizedEnsembleModel, self).__init__()
 
         self.state_dim = state_dim
