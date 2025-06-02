@@ -204,7 +204,7 @@ class CMBPO_SAC:
 
             if self.causal_bonus:
 
-                # TODO: Here the mixture still creates a bit of computational bottleneck
+                # TODO: Check if causal empowerment for only parents of reward is correctly implemented
                 # causal_empow = compute_causal_emp(self.ensemble_model, current_states, self.sac_agent)
                 causal_empow = compute_path_ce(self.est_cgm, self.ensemble_model, initial_states, self.sac_agent)
                 causal_empow_bonus = causal_empow.mean(dim=0)  # shape: (n_batch, sts_dim)
