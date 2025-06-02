@@ -5,7 +5,7 @@ import numpy as np
 from algs.sac import SAC, ReplayBuffer
 from dynamics.causal_models import StructureLearning, set_p_matrix
 from dynamics.utils import compute_jsd, compute_path_ce, linear_scheduler
-from dynamics.dynamics_models import EnsembleModel
+from dynamics.causal_dynamics_models import FactorizedEnsembleModel
 import matplotlib.pyplot as plt
 
 import gymnasium as gym
@@ -15,10 +15,6 @@ import time
 import random
 
 torch.set_default_dtype(torch.float32)
-
-def flatten_obs(o: dict[str, np.ndarray]) -> np.ndarray:
-    return np.concatenate([o["observation"], o["desired_goal"]], axis=0)
-
 
 # Check if MPS is available and set the device to 'mps' if on MacOS, 'cuda' if on GPU, or 'cpu' otherwise
 def set_device():
@@ -41,6 +37,7 @@ class CMBPO_SAC:
                  model_based: bool = True,
                  sl_method: str = 'PC',
                  bootstrap: str = 'standard',
+                 uncer_cgm_model: str = 'ensemble_sampling',
                  n_bootstrap: int = 10,
                  cgm_train_freq: int = 5_000,
                  warmup_steps: int = 1_000,
@@ -99,9 +96,8 @@ class CMBPO_SAC:
         self.sac_agent = SAC(self.state_dim, self.action_dim, self.max_action, lr=lr_sac, gamma=gamma,
                              tau=tau, alpha=alpha, device=self.device)
 
-        # TODO: Use Factored Dynamics Model instead of EnsembleModel (modelling every f_j)
-        self.ensemble_model = EnsembleModel(state_dim=self.state_dim, action_dim=self.action_dim, lr=lr_model,
-                                            device=self.device, ensemble_size=7).to(self.device)
+        self.ensemble_model = FactorizedEnsembleModel(state_dim=self.state_dim, action_dim=self.action_dim,
+                                                      device=self.device, ensemble_size=7, lr=lr_model).to(self.device)
         self.rollout_schedule = rollout_schedule
         self.real_buffer = ReplayBuffer(int(1_000_000))
         self.imaginary_buffer = ReplayBuffer(int(1_000_000))
@@ -110,6 +106,7 @@ class CMBPO_SAC:
 
         # Causal MBPO specific
         self.sl_method = sl_method
+        self.uncer_cgm_model = uncer_cgm_model
         self.bootstrap = bootstrap
         self.n_bootstrap = n_bootstrap
         self.cgm_train_freq = cgm_train_freq
@@ -129,50 +126,16 @@ class CMBPO_SAC:
         self.causal_bonus, self.causal_eta = causal_bonus, causal_eta
         self.var_causal_bonus, self.var_causal_eta = var_causal_bonus, var_causal_eta
 
-    # TODO: Change for Factored Dynamics Model
     def update_model(self, batch_size=256, epochs=100):
+        """
+        Updates the ensemble dynamics model using a batch of data from the real buffer.
+        The model is trained to predict the next state and reward given the current state and action.
+        """
+        model_loss = self.ensemble_model.train_factorized_ensemble(buffer=self.real_buffer,
+                                                             batch_size=batch_size, epochs=epochs)
 
-        if len(self.real_buffer) < 50_000:
-            epochs = epochs * 10
-        elif len(self.real_buffer) < 150_000:
-            epochs = epochs * 5
-        else:
-            epochs = epochs
+        return model_loss
 
-        for _ in range(epochs):
-
-            state, action, reward, next_state, done = self.real_buffer.sample(batch_size)
-
-            state = torch.FloatTensor(state).to(self.device)
-            action = torch.FloatTensor(action).to(self.device)
-            next_state = torch.FloatTensor(next_state).to(self.device)
-            reward = torch.FloatTensor(reward).to(self.device).unsqueeze(1)
-
-            # Compute delta state
-            delta_state = next_state - state
-
-            model_input = torch.cat([state, action], dim=1)
-            next_s_rew = torch.cat([delta_state, reward], dim=1)
-
-            # Normalize the inputs and outputs
-            model_input = self.ensemble_model.input_normalizer.normalize(model_input)
-            next_s_rew = self.ensemble_model.output_normalizer.normalize(next_s_rew)
-
-            mean_preds, logvar_preds = self.ensemble_model(model_input)
-
-            model_loss = 0
-            self.ensemble_model.model_optimizer.zero_grad()
-            for mean_pred, logvar_pred in zip(mean_preds, logvar_preds):
-                var_pred = torch.exp(logvar_pred)
-                model_loss += F.gaussian_nll_loss(mean_pred, next_s_rew, var_pred, reduction='mean')
-
-            # Compute the total loss
-            model_loss /= self.ensemble_model.ensemble_size
-
-            model_loss.backward()
-            self.ensemble_model.model_optimizer.step()
-
-        return model_loss.item()
 
     def counterfact_rollout(self):
         """
@@ -318,8 +281,11 @@ class CMBPO_SAC:
                                                 prior_knowledge=self.pk,
                                                 n_bootstrap=self.n_bootstrap)
 
-        # # Set parents of (s, a) to (ns, r) to -1
-        # self.ensemble_model.set_parents_from_prob_matrix(self.est_cgm)
+        # Update the dynamics model with structural uncertainty
+        self.ensemble_model.set_causal_structure_with_uncertainty(
+            adjacency_probs=torch.FloatTensor(self.est_cgm).to(self.device),
+            uncertainty_method=self.uncer_cgm_model
+        )
 
         # Plot DAG at the end of the training
         if self.log_wandb and len(self.real_buffer) % (self.cgm_train_freq + 1) == 0:

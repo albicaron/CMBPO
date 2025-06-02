@@ -310,17 +310,17 @@ class MBPO_SAC:
 
     def get_final_buffer(self, proportion_real=0.05):
 
-        # For Mujoco
-        if self.env_type == "gym_mujoco":
-            if len(self.real_buffer) < (self.warmup_steps + 1_000):
-                proportion_real = 0.5
-            else:
-                proportion_real = 0.05
-        else:
-            if len(self.real_buffer) < self.warmup_steps:
-                proportion_real = 0.5
-            else:
-                proportion_real = 0.05
+        # # For Mujoco
+        # if self.env_type == "gym_mujoco":
+        #     if len(self.real_buffer) < (self.warmup_steps + 1_000):
+        #         proportion_real = 0.5
+        #     else:
+        #         proportion_real = 0.05
+        # else:
+        #     if len(self.real_buffer) < self.warmup_steps:
+        #         proportion_real = 0.5
+        #     else:
+        #         proportion_real = 0.05
 
         # Function that creates a new ReplayBuffer with the data from the real buffer and imaginary buffer.
         if self.model_based:

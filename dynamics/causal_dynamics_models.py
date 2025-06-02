@@ -38,10 +38,8 @@ class RunningNormalizer:
 class FactorizedEnsembleModel(nn.Module):
     """
     A collection of (state_dim + 1) deep ensemble models. Each ensemble predicts one scalar
-    (state_i' or reward), outputting mean and logvar. So each dimension has
-    'ensemble_size' small MLPs. At forward time, we produce separate predictions
-    for each dimension. This factorization ensures each dimension can see only
-    the inputs we decide, if we like.
+    (state_i' or reward), outputting mean and logvar. This factorization allows each dimension
+    to see only the inputs specified by the causal graph.
     """
     def __init__(self, state_dim, action_dim, device, hidden_units=128, ensemble_size=10, lr=0.001):
         super(FactorizedEnsembleModel, self).__init__()
@@ -71,12 +69,93 @@ class FactorizedEnsembleModel(nn.Module):
         # Create a single optimizer for all the models parameters
         self.model_optimizer = optim.Adam(self.parameters(), lr=lr)
 
-        # Initialize running normalizers for inputs and outputs
+        # Initialize running normalizers
         self.input_normalizer = RunningNormalizer(state_dim + action_dim, device)
         self.output_normalizer = RunningNormalizer(state_dim + 1, device)
 
         # Put everything on the device
         self.to(device)
+
+        # Store individual causal masks for each ensemble member
+        # Shape: (ensemble_size, dimensions, state_dim + action_dim)
+        self.register_buffer('ensemble_causal_masks',
+                             torch.ones(ensemble_size, self.dimensions, state_dim + action_dim))
+
+        # Store the probabilistic adjacency matrix
+        self.register_buffer('prob_adjacency',
+                             torch.ones(self.dimensions, state_dim + action_dim))
+
+    def set_causal_structure_with_uncertainty(self, adjacency_probs, uncertainty_method='ensemble_sampling'):
+        """
+        Set causal structure handling uncertainty from bootstrapped PC.
+
+        Args:
+            adjacency_probs: Probabilistic adjacency matrix (dimensions, inputs)
+            uncertainty_method: How to handle uncertainty
+            min_prob_threshold: Minimum probability to consider an edge
+        """
+        # Extract relevant submatrix: (states+actions) -> (next_states+reward)
+        sub_cgm = adjacency_probs[:(self.state_dim + self.action_dim), (self.state_dim + self.action_dim):]
+        sub_cgm = torch.FloatTensor(sub_cgm).to(self.device)
+        self.prob_adjacency = sub_cgm.T  # Shape: (dimensions, inputs)
+
+        if uncertainty_method == 'ensemble_sampling':
+            self._set_ensemble_sampling_masks()
+        elif uncertainty_method == 'probabilistic_masking':
+            self._set_probabilistic_masks()
+        elif uncertainty_method == 'threshold_deterministic':
+            self._set_threshold_masks(threshold=0.5)
+        else:
+            raise ValueError(f"Unknown uncertainty method: {uncertainty_method}")
+
+    # 1) First method: Set masks based on ensemble sampling
+    def _set_ensemble_sampling_masks(self):
+        """
+        Set masks based on ensemble sampling from the probabilistic adjacency matrix.
+        """
+        # Each ensemble member will sample its own mask for each dimension
+        for d in range(self.dimensions):
+            for k in range(self.ensemble_size):
+                # Sample a mask for ensemble member k and dimension d
+                mask = torch.bernoulli(self.prob_adjacency[d]).to(self.device)
+
+                # Ensure at least one parent is selected
+                if mask.sum() == 0:
+                    mask[torch.argmax(self.prob_adjacency[d]).item()] = 1
+
+                self.ensemble_causal_masks[k, d] = mask
+
+    # 2) Second method: Set masks based on probabilistic adjacency matrix
+    def _set_probabilistic_masks(self):
+        """
+        Set masks based on the probabilistic adjacency matrix. Each ensemble member uses the same mask.
+        """
+        # All ensemble members use the same probabilistic mask, which means sample only once for each dimension d
+        for d in range(self.dimensions):
+            mask = torch.bernoulli(self.prob_adjacency[d]).to(self.device)
+
+            # Ensure at least one parent is selected
+            if mask.sum() == 0:
+                mask[torch.argmax(self.prob_adjacency[d]).item()] = 1
+
+            for k in range(self.ensemble_size):
+                self.ensemble_causal_masks[k, d] = mask
+
+    # 3) Third method: Set masks based on a threshold
+    def _set_threshold_masks(self, threshold=0.5):
+        """
+        Set masks based on a threshold applied to the probabilistic adjacency matrix.
+        Each ensemble member uses the same mask.
+        """
+        for d in range(self.dimensions):
+            mask = (self.prob_adjacency[d] >= threshold).to(self.device)
+
+            # Ensure at least one parent is selected
+            if mask.sum() == 0:
+                mask[torch.argmax(self.prob_adjacency[d]).item()] = 1
+
+            for k in range(self.ensemble_size):
+                self.ensemble_causal_masks[k, d] = mask
 
     def forward(self, x):
         """
@@ -98,7 +177,11 @@ class FactorizedEnsembleModel(nn.Module):
         for d in range(self.dimensions):
             means_dim = []
             logvars_dim = []
-            for model_k in self.dimensions_models[d]:
+
+            for k, model_k in enumerate(self.dimensions_models[d]):
+
+                # Apply ensemble specific causal mask
+
                 pred = model_k(x)  # shape (batch, 2)
                 mean_k = pred[:, 0:1]  # shape (batch,1)
                 logvar_k = pred[:, 1:2]  # shape (batch,1)
@@ -115,48 +198,48 @@ class FactorizedEnsembleModel(nn.Module):
 
         return means_all, logvars_all
 
-    def set_parents_from_prob_matrix(self, adjancency):
-        """
-        adjacency: a tensor of shape [ (state_dim + action_dim), (state_dim + 1) ],
-          where adjacency[i, d] = 1 (or True) means "Input i is a parent of output dim d."
-          - i in [0..(state_dim+action_dim-1)]
-          - d in [0..(state_dim)]
-
-        This method forcibly zeros out columns in the first Linear layer
-        for any input 'i' that is NOT a parent of dimension 'd'.
-
-        That is, if adjacency[i,d] = 0, then dimension d is not allowed
-        to see input i, so we set the entire column i in the first layer's weight to 0.
-
-        NOTE: This won't permanently freeze them at zero unless you also
-        clamp gradients or incorporate a forward-time mask. But it does
-        forcibly set them to zero *now*, so the network won't be using them
-        unless you train further with unmasked gradients.
-        :param adjancency:
-        :return:
-        """
-
-        # Sample a causal graph mask for each sample in the batch, for each in parents (ns, r)
-        sub_cgm_matrix = adjancency[:(self.state_dim + self.action_dim), (self.state_dim + self.action_dim):]
-        sub_cgm_matrix = torch.FloatTensor(sub_cgm_matrix).to(self.device)
-
-        for d in range(self.dimensions):
-            parents_d = sub_cgm_matrix[:, d]
-            for k in range(self.ensemble_size):
-
-                # Sample a causal mask specific for the k-th ensemble member
-                parents_d_k = torch.bernoulli(parents_d).to(self.device)
-
-                # Assure that if no parent is selected, the one with the highest weight is selected
-                if parents_d_k.sum() == 0:
-                    parents_d_k[torch.argmax(parents_d).item()] = 1
-
-                mlp_k = self.dimensions_models[d][k]
-                first_layer = mlp_k[0]
-                for i_in in range(self.state_dim + self.action_dim):
-                    if parents_d_k[i_in] == 0:
-                        # Zero out the entire column i_in
-                        first_layer.weight.data[:, i_in].zero_()
+    # def set_parents_from_prob_matrix(self, adjancency):
+    #     """
+    #     adjacency: a tensor of shape [ (state_dim + action_dim), (state_dim + 1) ],
+    #       where adjacency[i, d] = 1 (or True) means "Input i is a parent of output dim d."
+    #       - i in [0..(state_dim+action_dim-1)]
+    #       - d in [0..(state_dim)]
+    #
+    #     This method forcibly zeros out columns in the first Linear layer
+    #     for any input 'i' that is NOT a parent of dimension 'd'.
+    #
+    #     That is, if adjacency[i,d] = 0, then dimension d is not allowed
+    #     to see input i, so we set the entire column i in the first layer's weight to 0.
+    #
+    #     NOTE: This won't permanently freeze them at zero unless you also
+    #     clamp gradients or incorporate a forward-time mask. But it does
+    #     forcibly set them to zero *now*, so the network won't be using them
+    #     unless you train further with unmasked gradients.
+    #     :param adjancency:
+    #     :return:
+    #     """
+    #
+    #     # Sample a causal graph mask for each sample in the batch, for each in parents (ns, r)
+    #     sub_cgm_matrix = adjancency[:(self.state_dim + self.action_dim), (self.state_dim + self.action_dim):]
+    #     sub_cgm_matrix = torch.FloatTensor(sub_cgm_matrix).to(self.device)
+    #
+    #     for d in range(self.dimensions):
+    #         parents_d = sub_cgm_matrix[:, d]
+    #         for k in range(self.ensemble_size):
+    #
+    #             # Sample a causal mask specific for the k-th ensemble member
+    #             parents_d_k = torch.bernoulli(parents_d).to(self.device)
+    #
+    #             # Assure that if no parent is selected, the one with the highest weight is selected
+    #             if parents_d_k.sum() == 0:
+    #                 parents_d_k[torch.argmax(parents_d).item()] = 1
+    #
+    #             mlp_k = self.dimensions_models[d][k]
+    #             first_layer = mlp_k[0]
+    #             for i_in in range(self.state_dim + self.action_dim):
+    #                 if parents_d_k[i_in] == 0:
+    #                     # Zero out the entire column i_in
+    #                     first_layer.weight.data[:, i_in].zero_()
 
     def train_factorized_ensemble(self, buffer, batch_size, epochs=100):
         """
@@ -166,16 +249,8 @@ class FactorizedEnsembleModel(nn.Module):
           - next_states.shape= (N, state_dim)
           - rewards.shape= (N,)
         """
-
-        if len(buffer) < 50_000:
-            epochs = epochs * 10
-        elif len(buffer) < 150_000:
-            epochs = epochs * 5
-        else:
-            epochs = epochs
-
+        total_loss = 0.0
         for epoch in range(epochs):
-
             states, actions, rewards, next_states, done = buffer.sample(batch_size)
 
             # Convert to tensors on device
@@ -195,8 +270,7 @@ class FactorizedEnsembleModel(nn.Module):
             inputs = self.input_normalizer.normalize(inputs)
             targets = self.output_normalizer.normalize(targets)
 
-            means_all, logvars_all = self(inputs)
-
+            means_all, logvars_all = self(inputs)  # shape (state_dim+1, ensemble_size, N, 1)
             # means_all[d][k] => shape (N,1)
             # logvars_all[d][k] => shape (N,1)
 
@@ -206,14 +280,14 @@ class FactorizedEnsembleModel(nn.Module):
             total_loss = 0
             self.model_optimizer.zero_grad()
             for d in range(self.dimensions):
-                y = targets[:, d:d+1]  # shape (N,1)
+                y_d = targets[:, d:d+1]  # shape (N,1)
                 for k in range(self.ensemble_size):
                     mu = means_all[d][k]
                     logvar = logvars_all[d][k]
                     var = torch.exp(logvar)
                     # Gaussian NLL for dimension d, ensemble k:
                     # we can do e.g. MSE * 1/(2*var) + 0.5*logvar
-                    nll_k = 0.5*(logvar + (y - mu)**2 / var)
+                    nll_k = 0.5*(logvar + (y_d - mu)**2 / var)
                     total_loss += nll_k.mean()
 
                 # Average over ensemble members
@@ -223,5 +297,4 @@ class FactorizedEnsembleModel(nn.Module):
             total_loss.backward()
             self.model_optimizer.step()
 
-            return total_loss.item()
-
+        return total_loss.item()
