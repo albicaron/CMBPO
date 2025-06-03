@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+from typing import Optional
 
 from algs.sac import SAC, ReplayBuffer
 from dynamics.causal_models import StructureLearning, set_p_matrix
@@ -36,13 +37,13 @@ class CMBPO_SAC:
                  log_wandb: bool = False,
                  model_based: bool = True,
                  sl_method: str = 'PC',
-                 bootstrap: str = 'standard',
+                 bootstrap: Optional[str] = None,  # 'bootstrap' or 'no_bootstrap'
                  uncer_cgm_model: str = 'ensemble_sampling',
                  n_bootstrap: int = 10,
-                 cgm_train_freq: int = 5_000,
-                 warmup_steps: int = 1_000,
+                 cgm_train_freq: int = 2_000,
+                 warmup_steps: int = None,
                  eval_freq: int = 1_000,
-                 causal_bonus: bool = True,
+                 causal_bonus: bool = False,
                  causal_eta: float = 0.01,
                  var_causal_bonus: bool = False,
                  var_causal_eta: float = 0.001,
@@ -168,7 +169,6 @@ class CMBPO_SAC:
             actions = self.sac_agent.select_action(initial_states)
             actions = torch.FloatTensor(actions).to(self.device)
 
-            # TODO: Change for Factored Dynamics Model
             # Ensemble predictions: shape [ensemble_size, batch_size, next_state_dim+1]
             model_input = torch.cat([initial_states, actions], dim=1)
             model_input = self.ensemble_model.input_normalizer.normalize(model_input)
@@ -217,6 +217,7 @@ class CMBPO_SAC:
 
             if self.causal_bonus:
 
+                # TODO: Fix Bug in compute_path_ce (AttributeError: 'list' object has no attribute 'view')
                 # Compute causal empowerment using the factorized model
                 # This automatically benefits from structural uncertainty propagation
                 causal_empow = compute_path_ce(self.est_cgm, self.ensemble_model, initial_states, self.sac_agent)
@@ -284,7 +285,8 @@ class CMBPO_SAC:
     def update_cgm(self):
 
         # Learn the CGM with the last self.cgm_train_freq samples
-        last_cgm_data = self.real_buffer.buffer[-self.cgm_train_freq:]
+        size_cgm_data = min(self.cgm_train_freq * 2, len(self.real_buffer))
+        last_cgm_data = self.real_buffer.buffer[-size_cgm_data:]  # Use last `size_cgm_data` samples
         state, action, reward, next_state, _ = map(np.stack, zip(*last_cgm_data))
         reward = reward.reshape(-1, 1)
 
@@ -361,7 +363,7 @@ class CMBPO_SAC:
 
     def train(self, num_episodes=200, max_steps=1_000):
         if self.log_wandb:
-            project_name = self.env.unwrapped.spec.id if self.env.unwrapped.spec != None else 'SimpleCausal_Multi'
+            project_name = self.env.unwrapped.spec.id if self.env.unwrapped.spec != None else 'SimpleCausalMulti_v2'
             wandb.init(project=project_name, sync_tensorboard=False,
                        name=f"{self.alg_name}_SAC_seed_{self.seed}_time_{time.time()}",
                        config=self.__dict__, group=self.alg_name, dir='/tmp')
@@ -441,6 +443,12 @@ class CMBPO_SAC:
                         for _ in range(self.agent_steps):
                             s, a, r, ns, d = self.get_final_buffer()
                             critic_loss, actor_loss, alpha_loss = self.sac_agent.update(s, a, r, ns, d)
+
+                # Break if episode is done or if the maximum number of steps is reached
+                if terminal or self.total_steps >= target_steps:
+                    break
+
+            episode += 1
 
             # 6) Logging and Printing
             if self.log_wandb:

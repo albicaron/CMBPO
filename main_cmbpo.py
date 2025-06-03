@@ -10,6 +10,7 @@ import torch
 import gym
 
 from algs.cmbpo_sac import CMBPO_SAC, set_device  # type: ignore
+from envs.causal_env_multiaction import SimpleCausal_Multi
 
 
 def str2bool(v):
@@ -42,7 +43,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument('--seed', '-s', type=int, default=0, help='Random seed for NumPy and PyTorch.')
 
     # Training hyper‑parameters
-    parser.add_argument('--episodes', '-n', type=int, default=200, help='Total number of training episodes.')
+    parser.add_argument('--episodes', '-n', type=int, default=50, help='Total number of training episodes.')
     parser.add_argument('--steps', '-t', type=int, default=1_000, help='Maximum env steps per episode.')
 
     # The next is a "model-based" flag, but it is not used in the code as it is always true
@@ -78,16 +79,24 @@ def main(argv: Optional[list[str]] = None) -> None:
     device = set_device()
 
     # Environment -------------------------------------------------------------
-    env = make_env(args.env)
+    # gym.register_envs(gymnasium_robotics)
+    # env = make_env(args.env, max_episode_steps=args.steps)
+    env = SimpleCausal_Multi(shifted=False)
 
     # Create the agent
-    agent = CMBPO_SAC(env, args.seed, device,
-                      steps_per_epoch=args.steps,
+    agent = CMBPO_SAC(env,
+                      args.seed,
+                      device,
+                      agent_steps=10,
+                      rollout_per_step=100,
+                      warmup_steps=1_000,
+                      eval_freq=200,
+                      bootstrap=None,  # None for no bootstrap
                       log_wandb=args.log_wandb,
                       model_based=args.model_based)
 
     # Training ----------------------------------------------------------------
-    agent.train(num_episodes=args.episodes, max_steps=args.steps)
+    agent.train(num_episodes=100, max_steps=200)
 
     # Saving ------------------------------------------------------------------
     args.save_dir.mkdir(parents=True, exist_ok=True)

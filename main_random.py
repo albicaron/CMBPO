@@ -7,18 +7,18 @@ import time
 # Just run a random policy on the environment
 if __name__ == "__main__":
 
-    seed = 0
+    seed = 1
     num_episodes = 100
     max_steps = 200
 
-    project_name = "SimpleCausal_Multi"
+    project_name = "SimpleCausalMulti_v2"
     wandb.init(project=project_name, sync_tensorboard=False,
                name=f"RANDOM_seed_{seed}_time_{time.time()}",
                group="Random", dir='/tmp', config={"alg_name": "Random"})
 
     # env = SimpleCausalEnv(shifted=False)
     env = SimpleCausal_Multi(shifted=False)
-
+    global_step = 0
     for episode in range(num_episodes):
 
         state, _ = env.reset()
@@ -31,6 +31,7 @@ if __name__ == "__main__":
 
             episode_reward += reward
             episode_steps += 1
+            global_step += 1
 
             state = next_state
             if done:
@@ -38,7 +39,10 @@ if __name__ == "__main__":
 
         wandb.log({
             "Train/Episode Reward": episode_reward,
-            "Train/Episode Length": episode_steps
+            "Train/Episode Length": episode_steps,
+            "Train/Global Step": global_step,
+            "Eval/Average Return": episode_reward,  # For consistency, log the same reward in eval
+            "Eval/Global Step": global_step,
         })
 
         if episode % 1 == 0:

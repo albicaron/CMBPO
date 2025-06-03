@@ -17,6 +17,10 @@ def linear_scheduler(schedule_params: list[float], epoch: int) -> int:
     where a, b are the start and end of the schedule, measured in epochs
     returns: an integer rollout length = clamp( x + ((epoch-a)/(b-a))*(y-x) , [x,y] )
     """
+
+    if schedule_params is None:
+        return 1  # Default to max_length = 1 if no schedule is provided
+
     a, b, x, y = schedule_params
     if b == a:
         val = x

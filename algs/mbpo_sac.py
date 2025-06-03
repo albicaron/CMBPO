@@ -39,6 +39,7 @@ class MBPO_SAC:
                  gamma: float = 0.99,
                  tau: float = 0.005,
                  alpha: float = 0.2,
+                 warmup_steps: int = None,  # Warmup steps for the real buffer
                  max_rollout_len: int = 1,  # Max length of the rollout in steps
                  rollout_schedule: list = None,  # Schedule rollout length - for Half-Cheetah = [20_000, 100_000, 1, 15]
                  rollout_per_step: float = 400,  # Number of rollouts per training step
@@ -57,15 +58,19 @@ class MBPO_SAC:
         self.alg_name = 'MBPO_SAC' if self.model_based else 'SAC'
         self.eval_freq = eval_freq
 
-        if isinstance(env.observation_space, Dict):
+        if isinstance(env.observation_space, Dict) and warmup_steps is None:
             self.env_type = "gym_robotics"
             self.state_dim = (env.observation_space["observation"].shape[0] +
                               env.observation_space["desired_goal"].shape[0])
             self.warmup_steps = 500
-        else:
+        elif warmup_steps is None:
             self.env_type = "gym_mujoco"
             self.state_dim = env.observation_space.shape[0]
             self.warmup_steps = 5_000
+        else:
+            self.env_type = "custom"
+            self.state_dim = env.observation_space.shape[0]
+            self.warmup_steps = warmup_steps
 
         self.action_dim = env.action_space.shape[0]
         self.max_action = float(env.action_space.high[0])
@@ -348,7 +353,7 @@ class MBPO_SAC:
 
     def train(self, num_episodes: int = 200, max_steps: int = 1_000):
         if self.log_wandb:
-            project_name = self.env.unwrapped.spec.id if self.env.unwrapped.spec != None else 'SimpleCausal_Multi'
+            project_name = self.env.unwrapped.spec.id if self.env.unwrapped.spec != None else 'SimpleCausalMulti_v2'
             wandb.init(project=project_name, sync_tensorboard=False,
                        name=f"{self.alg_name}_SAC_seed_{self.seed}_time_{time.time()}",
                        config=self.__dict__, group=self.alg_name, dir='/tmp')

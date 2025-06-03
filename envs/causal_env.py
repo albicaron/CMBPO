@@ -1,5 +1,5 @@
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 import numpy as np
 
 
@@ -48,7 +48,7 @@ class SimpleCausalEnv(gym.Env):
         """
         # Initialize S1 and S2 to random values, e.g., between -1 and 1
         self.state = np.random.uniform(low=-1.0, high=-1.0, size=(2,)).astype(np.float32)
-        return self.state
+        return self.state, {}
 
     def step(self, action):
         """
@@ -86,7 +86,7 @@ class SimpleCausalEnv(gym.Env):
         # Define termination condition (optional)
         done = False
 
-        return self.state, R_t, done, False
+        return self.state, R_t, done, False, {}
 
     def get_adj_matrix(self):
         """

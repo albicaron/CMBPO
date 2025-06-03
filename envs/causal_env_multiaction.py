@@ -1,5 +1,5 @@
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 import numpy as np
 
 
@@ -10,7 +10,7 @@ class SimpleCausal_Multi(gym.Env):
         S1_{t+1) = S1_t + 0.8*A_1 + e1_t  # Depends on: S1_t, A_1
         S2_{t+1} = S2_t + 0.8*A_2 + e2_t  # Depends on: S2_t, A_2
 
-        R_t = 0.5 * S2_t + e3_t - 0.01  # Reward depends on: S1_t
+        R_t = 0.5 * S2_t + e3_t - 0.01  # Reward depends on: S2_t only
     Actions are continuous in [-1, 1]
     """
 
@@ -49,7 +49,7 @@ class SimpleCausal_Multi(gym.Env):
         """
         # Initialize S1 and S2 to random values, e.g., between -1 and 1
         self.state = np.random.uniform(low=-1.0, high=-1.0, size=(2,)).astype(np.float32)
-        return self.state
+        return self.state, {}
 
     def step(self, action):
         """
@@ -87,7 +87,7 @@ class SimpleCausal_Multi(gym.Env):
         # Define termination condition (optional)
         done = False
 
-        return self.state, R_t, done, False
+        return self.state, R_t, done, False, {}
 
     def get_adj_matrix(self):
         """

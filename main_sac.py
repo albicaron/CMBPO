@@ -8,7 +8,8 @@ from typing import Optional
 import numpy as np
 import torch
 import gymnasium as gym
-import gymnasium_robotics
+# import gymnasium_robotics
+from envs.causal_env_multiaction import SimpleCausal_Multi
 
 from algs.mbpo_sac import MBPO_SAC, set_device  # type: ignore
 
@@ -57,7 +58,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     # Logging and output
     parser.add_argument('--log_wandb',
                         action='store_true',
-                        default=False,
+                        default=True,
                         help='Enable Weights & Biases tracking.')
     parser.add_argument(
         '--save_dir',
@@ -81,18 +82,24 @@ def main(argv: Optional[list[str]] = None) -> None:
     device = set_device()
 
     # Environment -------------------------------------------------------------
-    gym.register_envs(gymnasium_robotics)
-    env = make_env(args.env, max_episode_steps=args.steps)
+    # gym.register_envs(gymnasium_robotics)
+    # env = make_env(args.env, max_episode_steps=args.steps)
+    env = SimpleCausal_Multi(shifted=False)
 
     # Agent -------------------------------------------------------------------
     agent = MBPO_SAC(env,
                      args.seed,
                      device,
+                     agent_steps=10,
+                     rollout_per_step=100,
+                     warmup_steps=1_000,
+                     eval_freq=200,
                      log_wandb=args.log_wandb,
                      model_based=args.model_based)
 
     # Training ----------------------------------------------------------------
-    agent.train(num_episodes=args.episodes, max_steps=args.steps)
+    # agent.train(num_episodes=args.episodes, max_steps=args.steps)
+    agent.train(num_episodes=100, max_steps=200)
 
     # Saving ------------------------------------------------------------------
     args.save_dir.mkdir(parents=True, exist_ok=True)

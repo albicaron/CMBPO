@@ -96,7 +96,7 @@ class FactorizedEnsembleModel(nn.Module):
         """
         # Extract relevant submatrix: (states+actions) -> (next_states+reward)
         sub_cgm = adjacency_probs[:(self.state_dim + self.action_dim), (self.state_dim + self.action_dim):]
-        sub_cgm = torch.FloatTensor(sub_cgm).to(self.device)
+        sub_cgm = torch.tensor(sub_cgm.clone().detach(), dtype=torch.float32, device=self.device)
         self.prob_adjacency = sub_cgm.T  # Shape: (dimensions, inputs)
 
         if uncertainty_method == 'ensemble_sampling':
