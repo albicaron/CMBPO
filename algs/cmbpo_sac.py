@@ -5,7 +5,7 @@ from typing import Optional
 
 from algs.sac import SAC, ReplayBuffer
 from dynamics.causal_models import StructureLearning, set_p_matrix
-from dynamics.utils import compute_jsd, compute_path_ce, linear_scheduler, validate_causal_empowerment_implementation
+from dynamics.utils import compute_jsd, compute_path_ce_factorized, linear_scheduler
 from dynamics.causal_dynamics_models import FactorizedEnsembleModel
 import matplotlib.pyplot as plt
 
@@ -226,22 +226,33 @@ class CMBPO_SAC:
 
                 # TODO: Fix Bug in compute_path_ce (AttributeError: 'list' object has no attribute 'view')
                 # Compute causal empowerment using the factorized model
-                # This automatically benefits from structural uncertainty propagation
-                causal_empow = compute_path_ce(self.est_cgm, self.ensemble_model, initial_states, self.sac_agent)
-                causal_empow_bonus = causal_empow.mean(dim=0)  # shape: (n_batch, n_relevant_dims)
-                std_causal_empow_bonus = causal_empow.std(dim=0)  # shape: (n_batch, n_relevant_dims)
+                # This automatically embeds structural uncertainty propagation (n_ensembles, n_batch, n_relevant_dims)
+                causal_empow = compute_path_ce_factorized(self.est_cgm, self.ensemble_model, initial_states, self.sac_agent)
+                causal_empow_mean = causal_empow.mean(dim=0)  # shape: (n_batch, n_relevant_dims)
 
-                # Scale CE by running std of the reward channel for numerical stability
+                # We sum by relevant dimensions, which rewards control over the relevant state dimensions
+                causal_empow_bonus = causal_empow_mean.sum(dim=1, keepdim=True)  # shape: (n_batch, 1)
+
+                # Scale by running std of the reward channel for numerical stability
                 reward_std = self.ensemble_model.output_normalizer.var[-1].detach().clamp_min(1e-6).sqrt()
-                de_meaned_ce = causal_empow_bonus - causal_empow_bonus.mean(dim=0)
-                norm_ce = (de_meaned_ce.sum(dim=1, keepdim=True) / (reward_std + 1e-6))
 
+                # De-mean and normalize the causal empowerment bonus
+                de_meaned_ce = causal_empow_bonus - causal_empow_bonus.mean()
+                norm_ce = de_meaned_ce / (reward_std + 1e-6)
+
+                # Apply the scaling factor
                 causal_bonus_tot = self.causal_eta * norm_ce
                 reward_pred += causal_bonus_tot
 
+                # For variance bonus, we want the total uncertainty across all dimensions
                 if self.var_causal_bonus:
-                    std_bonus = (std_causal_empow_bonus.sum(dim=1, keepdim=True) / (reward_std + 1e-6))
-                    reward_pred += self.var_causal_eta * std_bonus
+                    causal_empow_std = causal_empow.std(dim=0)  # Shape: (batch_size, n_causal_dims)
+                    std_causal_empow_bonus = causal_empow_std.sum(dim=1, keepdim=True)  # Shape: (batch_size, 1)
+
+                    # Similarly normalize the variance bonus
+                    de_meaned_std = std_causal_empow_bonus - std_causal_empow_bonus.mean()
+                    norm_std_bonus = de_meaned_std / (reward_std + 1e-6)
+                    reward_pred += self.var_causal_eta * norm_std_bonus
 
             # Replace the reward prediction with the augmented one
             mean_pred[:, -1] = reward_pred.squeeze(1)
@@ -441,8 +452,8 @@ class CMBPO_SAC:
                         self.counterfact_rollout()  # Generate imaginary rollouts
 
                     # 4) Learn Local Causal Graphical Model from the real buffer (once only after warm-up)
-                    # if self.total_steps % (self.cgm_train_freq + 1) == 0 and self.model_based:
-                    if self.total_steps == (self.cgm_train_freq + 1) and self.model_based:
+                    # if self.total_steps % self.cgm_train_freq == 0 and self.model_based:
+                    if self.total_steps == self.cgm_train_freq and self.model_based:
                         self.update_cgm()
 
                     # 5) Train the SAC agent

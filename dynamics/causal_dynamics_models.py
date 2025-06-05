@@ -35,6 +35,80 @@ class RunningNormalizer:
         return x * (self.var.sqrt() + 1e-8) + self.mean
 
 
+class AdaptiveCausalNormalizer:
+    """
+    A sophisticated normalizer that adapts to changing causal structures
+    by normalizing per-dimension empowerment before summing.
+    """
+
+    def __init__(self, state_dim, device, eps=1e-8):
+        self.state_dim = state_dim
+        self.device = device
+        self.eps = eps
+
+        # Maintain normalizers for individual dimension empowerment
+        self.per_dim_normalizer = RunningNormalizer(state_dim, device, eps)
+
+        # Also track the sum statistics
+        self.sum_normalizer = RunningNormalizer(1, device, eps)
+
+        # Track which dimensions are typically active
+        self.dim_activity = torch.zeros(state_dim, device=device)
+        self.activity_momentum = 0.99
+
+    def normalize_empowerment(self, empowerment_per_dim, active_dims):
+        """
+        Normalize empowerment values accounting for which dimensions are active.
+
+        Args:
+            empowerment_per_dim: Empowerment values for each dimension (K, B, n_dims)
+            active_dims: Indices of dimensions that are causally relevant
+
+        Returns:
+            Normalized total empowerment (K, B, 1)
+        """
+        K, B, n_dims = empowerment_per_dim.shape
+
+        # Update activity tracking
+        activity_mask = torch.zeros(self.state_dim, device=self.device)
+        activity_mask[active_dims] = 1.0
+        self.dim_activity = (self.activity_momentum * self.dim_activity +
+                             (1 - self.activity_momentum) * activity_mask)
+
+        # Create a full-sized tensor with zeros for inactive dimensions
+        full_empowerment = torch.zeros(K, B, self.state_dim, device=self.device)
+        full_empowerment[:, :, active_dims] = empowerment_per_dim
+
+        # Update per-dimension statistics using the full tensor
+        # This maintains consistent statistics even as dimensions activate/deactivate
+        for k in range(K):
+            self.per_dim_normalizer.update(full_empowerment[k])
+
+        # Normalize each dimension independently
+        normalized_per_dim = torch.zeros_like(full_empowerment)
+        for i in range(self.state_dim):
+            if i in active_dims:
+                # Find the index in the compressed empowerment_per_dim
+                dim_idx = (active_dims == i).nonzero(as_tuple=True)[0].item()
+
+                # Normalize using dimension-specific statistics
+                dim_mean = self.per_dim_normalizer.mean[i]
+                dim_std = torch.sqrt(self.per_dim_normalizer.var[i] + self.eps)
+
+                normalized_per_dim[:, :, i] = (empowerment_per_dim[:, :, dim_idx] - dim_mean) / dim_std
+
+        # Sum only the active dimensions
+        empowerment_sum = normalized_per_dim[:, :, active_dims].sum(dim=2, keepdim=True)
+
+        # Update sum statistics
+        self.sum_normalizer.update(empowerment_sum.reshape(-1, 1))
+
+        # Final normalization of the sum
+        final_normalized = self.sum_normalizer.normalize(empowerment_sum)
+
+        return final_normalized
+
+
 class FactorizedEnsembleModel(nn.Module):
     """
     A collection of (state_dim + 1) deep ensemble models. Each ensemble predicts one scalar
