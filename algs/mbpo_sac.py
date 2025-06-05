@@ -5,9 +5,11 @@ import torch.nn.functional as F
 from algs.sac import SAC, ReplayBuffer, HERReplayBuffer
 from dynamics.utils import compute_jsd, linear_scheduler, flatten_obs
 from dynamics.dynamics_models import EnsembleModel, mbpo_nll
+from utils.utils import analyze_policy_gradients, compute_action_metrics
 
 import gymnasium as gym
 from gymnasium.spaces import Dict
+from collections import deque
 
 import wandb
 import time
@@ -104,6 +106,10 @@ class MBPO_SAC:
         else:
             self.real_buffer = ReplayBuffer(int(1_000_000))
         self.imaginary_buffer = ReplayBuffer(int(1_000_000))
+
+        # Action tracking
+        self.action_history = deque(maxlen=1000)  # Store recent actions for analysis
+        self.state_action_pairs = deque(maxlen=1000)  # Store state-action pairs
 
     def update_model(
         self,
@@ -371,6 +377,7 @@ class MBPO_SAC:
                 state, _ = self.env.reset()
 
             episode_reward, episode_steps = 0, 0
+            episode_actions = []  # Store actions for the episode
 
             # 1) First chunk: roll an episode with the real environment and populate the real buffer
             for step in range(max_steps):
@@ -396,6 +403,31 @@ class MBPO_SAC:
                     next_state, reward, done, truncated, _ = self.env.step(action)
                     terminal = done or truncated
                     self.real_buffer.push(state, action, reward, next_state, terminal)
+
+                # Store the action for the episode
+                episode_actions.append(action)
+                self.action_history.append(action)
+                self.state_action_pairs.append((state.copy(), action.copy()))
+
+                # Log action metrics periodically
+                if self.total_steps % 1_000 == 0 and len(self.action_history) > 50:
+                    # Convert recent actions to numpy array
+                    recent_actions = np.array(list(self.action_history))
+
+                    # Compute action metrics
+                    action_metrics = compute_action_metrics(recent_actions)
+
+                    # Compute gradient metrics
+                    recent_states = [pair[0] for pair in list(self.state_action_pairs)[-100:]]
+                    grad_metrics = analyze_policy_gradients(recent_states, policy_agent=self.sac_agent)
+                    action_metrics.update(grad_metrics)
+
+                    # Log to wandb
+                    if self.log_wandb:
+                        wandb.log({f"Policy/{k}": v for k, v in action_metrics.items()}, step=self.total_steps)
+                        irrelevance_score = ((action_metrics.get('mean_abs_a2', 1) / (action_metrics.get('mean_abs_a1', 1) + 1e-8)) *
+                                             (action_metrics.get('std_a2', 1) / (action_metrics.get('std_a1', 1) + 1e-8)))
+                        wandb.log({"Policy/a1_irrelevance_score": irrelevance_score})
 
                 # Set state to next_state and increment the episode reward and steps
                 state = next_state

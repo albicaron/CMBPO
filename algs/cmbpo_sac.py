@@ -10,6 +10,8 @@ from dynamics.causal_dynamics_models import FactorizedEnsembleModel
 import matplotlib.pyplot as plt
 
 import gymnasium as gym
+from utils.utils import analyze_policy_gradients, compute_action_metrics
+from collections import deque
 
 import wandb
 import time
@@ -126,6 +128,11 @@ class CMBPO_SAC:
 
         self.causal_bonus, self.causal_eta = causal_bonus, causal_eta
         self.var_causal_bonus, self.var_causal_eta = var_causal_bonus, var_causal_eta
+
+        # Action tracking
+        self.action_history = deque(maxlen=1000)  # Store recent actions for analysis
+        self.state_action_pairs = deque(maxlen=1000)  # Store state-action pairs
+
 
     def update_model(self, batch_size=256, epochs=100):
         """
@@ -285,8 +292,8 @@ class CMBPO_SAC:
     def update_cgm(self):
 
         # Learn the CGM with the last self.cgm_train_freq samples
-        size_cgm_data = min(self.cgm_train_freq * 2, len(self.real_buffer))
-        last_cgm_data = self.real_buffer.buffer[-size_cgm_data:]  # Use last `size_cgm_data` samples
+        # size_cgm_data = min(self.cgm_train_freq * 2, len(self.real_buffer))
+        last_cgm_data = self.real_buffer.buffer[-self.cgm_train_freq:]  # Use last `size_cgm_data` samples
         state, action, reward, next_state, _ = map(np.stack, zip(*last_cgm_data))
         reward = reward.reshape(-1, 1)
 
@@ -301,37 +308,11 @@ class CMBPO_SAC:
             uncertainty_method=self.uncer_cgm_model
         )
 
-        # Validate the implementation (optional but recommended)
-        validation_results = self.validate_causal_implementation()
-
         # Plot DAG at the end of the training
         if self.log_wandb and len(self.real_buffer) % (self.cgm_train_freq + 1) == 0:
             fig = self.local_cgm.plot_dag(self.est_cgm, self.true_cgm)
             wandb.log({"Train/Estimated CGM": wandb.Image(fig)})
             plt.close(fig)
-
-    def validate_causal_implementation(self):
-        """
-        Validate that the causal empowerment implementation is working correctly.
-        Call this after CGM updates to ensure everything is functioning properly.
-        """
-        if len(self.real_buffer) < 1000:  # Need enough data for meaningful validation
-            return {}
-
-        # Sample some states for validation
-        states, _, _, _, _ = self.real_buffer.sample(min(100, len(self.real_buffer)))
-        test_states = torch.FloatTensor(states).to(self.device)
-
-        # Run validation
-        from dynamics.utils import validate_causal_empowerment_implementation
-        validation_results = validate_causal_empowerment_implementation(
-            self.ensemble_model, test_states, self.sac_agent
-        )
-
-        if self.log_wandb:
-            wandb.log({f"Validation/{k}": v for k, v in validation_results.items()})
-
-        return validation_results
 
     def get_final_buffer(self, proportion_real=0.05):
 
@@ -375,6 +356,7 @@ class CMBPO_SAC:
         while self.total_steps < target_steps:
             state, _ = self.env.reset()
             episode_reward, episode_steps = 0, 0
+            episode_actions = []  # Store actions for the episode
 
             # 1) First chunk: roll an episode within the real environment and populate the real buffer
             for step in range(max_steps):
@@ -388,6 +370,31 @@ class CMBPO_SAC:
                 terminal = done or truncated
 
                 self.real_buffer.push(state, action, reward, next_state, terminal)
+
+                # Store the action for the episode
+                episode_actions.append(action)
+                self.action_history.append(action)
+                self.state_action_pairs.append((state.copy(), action.copy()))
+
+                # Log action metrics periodically
+                if self.total_steps % 1_000 == 0 and len(self.action_history) > 50:
+                    # Convert recent actions to numpy array
+                    recent_actions = np.array(list(self.action_history))
+
+                    # Compute action metrics
+                    action_metrics = compute_action_metrics(recent_actions)
+
+                    # Compute gradient metrics
+                    recent_states = [pair[0] for pair in list(self.state_action_pairs)[-100:]]
+                    grad_metrics = analyze_policy_gradients(recent_states, policy_agent=self.sac_agent)
+                    action_metrics.update(grad_metrics)
+
+                    # Log to wandb
+                    if self.log_wandb:
+                        wandb.log({f"Policy/{k}": v for k, v in action_metrics.items()}, step=self.total_steps)
+                        irrelevance_score = ((action_metrics.get('mean_abs_a2', 1) / (action_metrics.get('mean_abs_a1', 1) + 1e-8)) *
+                                             (action_metrics.get('std_a2', 1) / (action_metrics.get('std_a1', 1) + 1e-8)))
+                        wandb.log({"Policy/a1_irrelevance_score": irrelevance_score})
 
                 # Set state to next_state and increment the episode reward and steps
                 state = next_state
@@ -433,9 +440,9 @@ class CMBPO_SAC:
                     if self.total_steps % self.model_train_freq == 0 and self.model_based:
                         self.counterfact_rollout()  # Generate imaginary rollouts
 
-                    # 4) Learn Local Causal Graphical Model from the real buffer
-                    if self.total_steps % (self.cgm_train_freq + 1) == 0 and self.model_based:
-                    # if total_steps == (self.cgm_train_freq + 1) and self.model_based and self.causal_bonus:
+                    # 4) Learn Local Causal Graphical Model from the real buffer (once only after warm-up)
+                    # if self.total_steps % (self.cgm_train_freq + 1) == 0 and self.model_based:
+                    if self.total_steps == (self.cgm_train_freq + 1) and self.model_based:
                         self.update_cgm()
 
                     # 5) Train the SAC agent

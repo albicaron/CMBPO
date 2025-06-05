@@ -92,7 +92,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                      device,
                      agent_steps=10,
                      rollout_per_step=100,
-                     warmup_steps=1_000,
+                     warmup_steps=2_000,
                      eval_freq=200,
                      log_wandb=args.log_wandb,
                      model_based=args.model_based)

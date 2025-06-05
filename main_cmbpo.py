@@ -55,7 +55,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     # Logging and output
     parser.add_argument('--log_wandb',
                         action='store_true',
-                        default=True,
+                        default=False,
                         help='Enable Weights & Biases tracking.')
     parser.add_argument(
         '--save_dir',
@@ -89,9 +89,10 @@ def main(argv: Optional[list[str]] = None) -> None:
                       device,
                       agent_steps=10,
                       rollout_per_step=100,
-                      warmup_steps=1_000,
+                      warmup_steps=2_000,
                       eval_freq=200,
                       bootstrap=None,  # None for no bootstrap
+                      causal_bonus=True,
                       log_wandb=args.log_wandb,
                       model_based=args.model_based)
 
